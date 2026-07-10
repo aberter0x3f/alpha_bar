@@ -13,6 +13,7 @@ use crate::state::Icon;
 
 const TRAY_ICON_LOGICAL_SIZE: u32 = 20;
 const ICON_RENDER_CACHE_MAX_BYTES: usize = 512 * 1024;
+const ICON_EXTENSIONS: &[&str] = &["svg", "png"];
 
 pub(super) fn tray_icon_size(scale: u32) -> u32 {
   TRAY_ICON_LOGICAL_SIZE * scale.max(1)
@@ -22,16 +23,11 @@ pub(super) fn current_icon_theme() -> String {
   let dirs = config_dirs();
   dirs
     .iter()
-    .find_map(|dir| read_icon_theme(&dir.join("gtk-3.0/settings.ini")))
+    .find_map(|dir| read_icon_theme(&dir.join("gtk-4.0/settings.ini")))
     .or_else(|| {
       dirs
         .iter()
-        .find_map(|dir| read_icon_theme(&dir.join("gtk-4.0/settings.ini")))
-    })
-    .or_else(|| {
-      dirs
-        .iter()
-        .find_map(|dir| read_kde_icon_theme(&dir.join("kdeglobals")))
+        .find_map(|dir| read_icon_theme(&dir.join("gtk-3.0/settings.ini")))
     })
     .unwrap_or_else(|| "hicolor".into())
 }
@@ -60,23 +56,8 @@ fn read_icon_theme(path: &Path) -> Option<String> {
     .filter(|name| !name.is_empty())
 }
 
-fn read_kde_icon_theme(path: &Path) -> Option<String> {
-  let mut in_icons = false;
-  for line in fs::read_to_string(path).ok()?.lines().map(str::trim) {
-    if line.starts_with('[') && line.ends_with(']') {
-      in_icons = &line[1..line.len() - 1] == "Icons";
-    } else if in_icons
-      && let Some(theme) = line.strip_prefix("Theme=").map(str::trim)
-      && !theme.is_empty()
-    {
-      return Some(theme.to_owned());
-    }
-  }
-  None
-}
-
 pub(super) fn xdg_data_roots() -> Vec<PathBuf> {
-  let mut roots = vec![PathBuf::from("/run/current-system/sw/share")];
+  let mut roots = Vec::new();
   if let Some(home) = std::env::var_os("XDG_DATA_HOME") {
     roots.push(PathBuf::from(home));
   } else if let Some(home) = std::env::var_os("HOME") {
@@ -218,14 +199,13 @@ pub(super) fn find_icon_path(
     let _ = icon_path_cache().lock().ok()?.remove(&key);
   }
   let icon_roots = icon_roots(item_theme_path, xdg_data_roots);
-  let path = lookup_theme(icon_name, icon_size, 1, theme, &icon_roots, &mut Vec::new())
+  let path = lookup_theme(icon_name, icon_size, theme, &icon_roots, &mut Vec::new())
     .or_else(|| {
       (theme != "hicolor")
         .then(|| {
           lookup_theme(
             icon_name,
             icon_size,
-            1,
             "hicolor",
             &icon_roots,
             &mut Vec::new(),
@@ -347,22 +327,13 @@ fn icon_roots(item_theme_path: Option<&Path>, xdg_data_roots: &[PathBuf]) -> Vec
     .into_iter()
     .map(Path::to_path_buf)
     .collect::<Vec<_>>();
-  roots.push(home_icons_dir());
   roots.extend(xdg_data_roots.iter().map(|root| root.join("icons")));
   roots
-}
-
-fn home_icons_dir() -> PathBuf {
-  std::env::var_os("HOME").map_or_else(
-    || PathBuf::from(".icons"),
-    |home| PathBuf::from(home).join(".icons"),
-  )
 }
 
 fn lookup_theme(
   icon: &str,
   size: u32,
-  scale: u32,
   theme: &str,
   roots: &[PathBuf],
   seen: &mut Vec<String>,
@@ -371,238 +342,152 @@ fn lookup_theme(
     return None;
   }
   seen.push(theme.to_owned());
-  let theme_dirs = theme_dirs(theme, roots)?;
-  lookup_in_theme_dirs(icon, size, scale, &theme_dirs, true)
-    .or_else(|| lookup_in_theme_dirs(icon, size, scale, &theme_dirs, false))
-    .or_else(|| {
-      theme_dirs
-        .inherits
-        .iter()
-        .find_map(|parent| lookup_theme(icon, size, scale, parent, roots, seen))
-    })
-}
-
-#[derive(Clone)]
-struct ThemeDirs {
-  bases: Vec<PathBuf>,
-  dirs: Vec<IconDir>,
-  inherits: Vec<String>,
-}
-
-#[derive(Clone)]
-struct IconDir {
-  name: String,
-  size: u32,
-  scale: u32,
-  min: u32,
-  max: u32,
-  threshold: u32,
-  kind: DirKind,
-}
-
-#[derive(Clone, Copy)]
-enum DirKind {
-  Fixed,
-  Scalable,
-  Threshold,
-}
-
-fn theme_dirs(theme: &str, roots: &[PathBuf]) -> Option<ThemeDirs> {
-  let cache_key = ThemeDirsKey {
-    theme: theme.to_owned(),
-    roots: roots.to_vec(),
-  };
   let bases = roots
     .iter()
     .map(|root| root.join(theme))
     .filter(|path| path.is_dir())
     .collect::<Vec<_>>();
-  let index = bases
+  let index = theme_index(theme, roots, &bases);
+  index
+    .as_ref()
+    .and_then(|index| lookup_index_dirs(icon, size, index))
+    .or_else(|| {
+      index
+        .as_ref()
+        .into_iter()
+        .flat_map(|index| index.inherits.iter())
+        .find_map(|parent| lookup_theme(icon, size, &parent, roots, seen))
+    })
+}
+
+#[derive(Clone)]
+struct ThemeIndex {
+  bases: Vec<PathBuf>,
+  dirs: Vec<ThemeDir>,
+  inherits: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ThemeDir {
+  name: String,
+  size: u32,
+  scale: u32,
+}
+
+fn lookup_index_dirs(icon: &str, size: u32, index: &ThemeIndex) -> Option<PathBuf> {
+  index
+    .dirs
+    .iter()
+    .filter_map(|dir| {
+      index
+        .bases
+        .iter()
+        .find_map(|base| icon_file(&base.join(&dir.name), icon))
+        .map(|path| (size_score(dir.size * dir.scale, size), path))
+    })
+    .min_by_key(|(score, _)| *score)
+    .map(|(_, path)| path)
+}
+
+fn theme_index(theme: &str, roots: &[PathBuf], bases: &[PathBuf]) -> Option<ThemeIndex> {
+  let cache_key = ThemeIndexKey {
+    theme: theme.to_owned(),
+    roots: roots.to_vec(),
+  };
+  let path = bases
     .iter()
     .map(|base| base.join("index.theme"))
     .find(|path| path.exists())?;
-  let metadata = fs::metadata(&index).ok()?;
+  let metadata = fs::metadata(&path).ok()?;
   let modified = metadata.modified().ok();
   let len = metadata.len();
-  if let Some(cached) = theme_dirs_cache().lock().ok()?.get(&cache_key).cloned()
-    && cached.index == index
+  if let Some(cached) = theme_index_cache().lock().ok()?.get(&cache_key).cloned()
+    && cached.path == path
     && cached.modified == modified
     && cached.len == len
-    && cached.dirs.bases == bases
+    && cached.index.bases == bases
   {
-    return Some(cached.dirs);
+    return Some(cached.index);
   }
-  let index_text = fs::read_to_string(&index).ok()?;
-  let parsed = parse_theme_index(&index_text);
-  let dirs = parsed
-    .value("Icon Theme", "Directories")
+  let text = fs::read_to_string(&path).ok()?;
+  let dirs = index_value(&text, "Icon Theme", "Directories")
     .into_iter()
-    .chain(parsed.value("Icon Theme", "ScaledDirectories"))
+    .chain(index_value(&text, "Icon Theme", "ScaledDirectories"))
     .flat_map(split_list)
-    .filter_map(|name| icon_dir(&parsed, &name))
+    .map(|name| ThemeDir {
+      size: theme_dir_number(&text, &name, "Size"),
+      scale: theme_dir_number(&text, &name, "Scale").max(1),
+      name,
+    })
     .collect();
-  let theme_dirs = ThemeDirs {
-    bases,
+  let index = ThemeIndex {
+    bases: bases.to_vec(),
     dirs,
-    inherits: parsed
-      .value("Icon Theme", "Inherits")
-      .map_or_else(Vec::new, split_list),
+    inherits: index_value(&text, "Icon Theme", "Inherits").map_or_else(Vec::new, split_list),
   };
-  theme_dirs_cache().lock().ok()?.insert(
+  theme_index_cache().lock().ok()?.insert(
     cache_key,
-    CachedThemeDirs {
-      index,
+    CachedThemeIndex {
+      path,
       modified,
       len,
-      dirs: theme_dirs.clone(),
+      index: index.clone(),
     },
   );
-  Some(theme_dirs)
+  Some(index)
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
-struct ThemeDirsKey {
+struct ThemeIndexKey {
   theme: String,
   roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
-struct CachedThemeDirs {
-  index: PathBuf,
+struct CachedThemeIndex {
+  path: PathBuf,
   modified: Option<SystemTime>,
   len: u64,
-  dirs: ThemeDirs,
+  index: ThemeIndex,
 }
 
-static THEME_DIRS_CACHE: OnceLock<Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>>> = OnceLock::new();
+static THEME_INDEX_CACHE: OnceLock<Mutex<HashMap<ThemeIndexKey, CachedThemeIndex>>> =
+  OnceLock::new();
 
-fn theme_dirs_cache() -> &'static Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>> {
-  THEME_DIRS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn theme_index_cache() -> &'static Mutex<HashMap<ThemeIndexKey, CachedThemeIndex>> {
+  THEME_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-struct ThemeIndex {
-  values: HashMap<(String, String), String>,
+fn theme_dir_number(index: &str, name: &str, key: &str) -> u32 {
+  index_value(index, name, key)
+    .and_then(|value| value.parse().ok())
+    .or_else(|| {
+      let first = name.split('/').next()?;
+      if key == "Scale" {
+        return first.split_once('@')?.1.split_once('x')?.0.parse().ok();
+      }
+      first.split('@').next()?.parse().ok()
+    })
+    .unwrap_or(if key == "Scale" {
+      1
+    } else {
+      TRAY_ICON_LOGICAL_SIZE
+    })
 }
 
-impl ThemeIndex {
-  fn value(&self, section: &str, name: &str) -> Option<&str> {
-    self
-      .values
-      .get(&(section.to_owned(), name.to_owned()))
-      .map(String::as_str)
-  }
-}
-
-fn parse_theme_index(text: &str) -> ThemeIndex {
-  let mut section = String::new();
-  let mut values = HashMap::new();
-  for line in text.lines() {
-    let line = line.trim();
+fn index_value<'a>(text: &'a str, section: &str, name: &str) -> Option<&'a str> {
+  let mut current = "";
+  for line in text.lines().map(str::trim) {
     if line.starts_with('[') && line.ends_with(']') {
-      section.clear();
-      section.push_str(&line[1..line.len() - 1]);
-      continue;
-    }
-    if line.is_empty() || line.starts_with('#') {
-      continue;
-    }
-    if let Some((key, value)) = line.split_once('=') {
-      values.insert(
-        (section.clone(), key.trim().to_owned()),
-        value.trim().to_owned(),
-      );
+      current = &line[1..line.len() - 1];
+    } else if current == section
+      && let Some((key, value)) = line.split_once('=')
+      && key.trim() == name
+    {
+      return Some(value.trim());
     }
   }
-  ThemeIndex { values }
-}
-
-fn icon_dir(index: &ThemeIndex, name: &str) -> Option<IconDir> {
-  let size = index.value(name, "Size")?.parse().ok()?;
-  let scale = index
-    .value(name, "Scale")
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(1);
-  let kind = match index.value(name, "Type") {
-    Some("Fixed") => DirKind::Fixed,
-    Some("Scalable") => DirKind::Scalable,
-    _ => DirKind::Threshold,
-  };
-  Some(IconDir {
-    name: name.to_owned(),
-    size,
-    scale,
-    min: index
-      .value(name, "MinSize")
-      .and_then(|v| v.parse().ok())
-      .unwrap_or(size),
-    max: index
-      .value(name, "MaxSize")
-      .and_then(|v| v.parse().ok())
-      .unwrap_or(size),
-    threshold: index
-      .value(name, "Threshold")
-      .and_then(|v| v.parse().ok())
-      .unwrap_or(2),
-    kind,
-  })
-}
-
-fn lookup_in_theme_dirs(
-  icon: &str,
-  size: u32,
-  scale: u32,
-  theme: &ThemeDirs,
-  exact: bool,
-) -> Option<PathBuf> {
-  let mut best = None;
-  for dir in &theme.dirs {
-    if exact && !dir_matches(dir, size, scale) {
-      continue;
-    }
-    for base in &theme.bases {
-      let Some(path) = icon_file(&base.join(&dir.name), icon) else {
-        continue;
-      };
-      if exact {
-        return Some(path);
-      }
-      let score = dir_score(dir, size, scale);
-      if best.as_ref().is_none_or(|(best, _)| score < *best) {
-        best = Some((score, path));
-      }
-    }
-  }
-  best.map(|(_, path)| path)
-}
-
-fn dir_matches(dir: &IconDir, size: u32, scale: u32) -> bool {
-  if dir.scale != scale {
-    return false;
-  }
-  match dir.kind {
-    DirKind::Fixed => dir.size == size,
-    DirKind::Scalable => dir.min <= size && size <= dir.max,
-    DirKind::Threshold => {
-      dir.size.saturating_sub(dir.threshold) <= size && size <= dir.size + dir.threshold
-    }
-  }
-}
-
-fn dir_score(dir: &IconDir, size: u32, scale: u32) -> (u8, u32) {
-  let icon = size * scale;
-  match dir.kind {
-    DirKind::Fixed => size_score(dir.size * dir.scale, icon),
-    DirKind::Scalable if icon < dir.min * dir.scale => size_score(dir.min * dir.scale, icon),
-    DirKind::Scalable if icon > dir.max * dir.scale => size_score(dir.max * dir.scale, icon),
-    DirKind::Scalable => (0, 0),
-    DirKind::Threshold if icon < dir.size.saturating_sub(dir.threshold) * dir.scale => {
-      size_score(dir.size.saturating_sub(dir.threshold) * dir.scale, icon)
-    }
-    DirKind::Threshold if icon > (dir.size + dir.threshold) * dir.scale => {
-      size_score((dir.size + dir.threshold) * dir.scale, icon)
-    }
-    DirKind::Threshold => (0, 0),
-  }
+  None
 }
 
 fn size_score(candidate: u32, target: u32) -> (u8, u32) {
@@ -614,7 +499,7 @@ fn size_score(candidate: u32, target: u32) -> (u8, u32) {
 }
 
 fn icon_file(dir: &Path, icon: &str) -> Option<PathBuf> {
-  ["svg", "png"]
+  ICON_EXTENSIONS
     .iter()
     .map(|ext| dir.join(format!("{icon}.{ext}")))
     .find(|path| path.exists())
@@ -642,16 +527,14 @@ fn split_list(value: &str) -> Vec<String> {
     .map(str::to_owned)
     .collect()
 }
+
 pub(super) fn choose_pixmap(pixmaps: &[(i32, i32, Vec<u8>)], icon_size: u32) -> Option<Icon> {
   pixmaps
     .iter()
-    .min_by_key(|(width, height, _)| pixmap_score(*width, *height, icon_size))
+    .min_by_key(|(width, height, _)| {
+      size_score(u32::try_from((*width).min(*height)).unwrap_or(0), icon_size)
+    })
     .and_then(|pixmap| icon_from_argb(pixmap.0, pixmap.1, &pixmap.2))
-}
-
-fn pixmap_score(width: i32, height: i32, target: u32) -> (u8, u32) {
-  let candidate = u32::try_from(width.min(height)).unwrap_or(0);
-  size_score(candidate, target)
 }
 
 #[cfg(test)]
@@ -722,12 +605,12 @@ mod tests {
     fs::create_dir_all(xdg_icon.parent().unwrap()).unwrap();
     fs::write(
       item_theme.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\n",
     )
     .unwrap();
     fs::write(
       xdg_theme.join("index.theme"),
-      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\n",
     )
     .unwrap();
     fs::write(&item_icon, []).unwrap();
@@ -757,7 +640,7 @@ mod tests {
     fs::create_dir_all(large.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=16x16/status,32x32/status\n[16x16/status]\nSize=16\nType=Fixed\n[32x32/status]\nSize=32\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=16x16/status,32x32/status\n[16x16/status]\nSize=16\n[32x32/status]\nSize=32\n",
     )
     .unwrap();
     fs::write(&small, []).unwrap();
@@ -787,7 +670,7 @@ mod tests {
     fs::create_dir_all(high.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=20x20/status,40x40/status\n[20x20/status]\nSize=20\nType=Fixed\n[40x40/status]\nSize=40\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=20x20/status,40x40/status\n[20x20/status]\nSize=20\n[40x40/status]\nSize=40\n",
     )
     .unwrap();
     fs::write(&normal, []).unwrap();
@@ -817,7 +700,7 @@ mod tests {
     fs::create_dir_all(scaled.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=20x20/status\nScaledDirectories=20x20@2/status\n[20x20/status]\nSize=20\nType=Fixed\n[20x20@2/status]\nSize=20\nScale=2\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=20x20/status\nScaledDirectories=20x20@2/status\n[20x20/status]\nSize=20\n[20x20@2/status]\nSize=20\nScale=2\n",
     )
     .unwrap();
     fs::write(&normal, []).unwrap();
@@ -848,7 +731,7 @@ mod tests {
     fs::create_dir_all(png.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\n",
     )
     .unwrap();
     fs::write(&png, []).unwrap();
@@ -875,7 +758,7 @@ mod tests {
     fs::create_dir_all(icon.parent().unwrap()).unwrap();
     fs::write(
       root.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\n",
     )
     .unwrap();
     fs::write(
@@ -911,7 +794,7 @@ mod tests {
     fs::create_dir_all(icon.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/Selected/index.theme"),
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\n",
     )
     .unwrap();
     fs::write(&icon, []).unwrap();
@@ -959,7 +842,7 @@ mod tests {
           .parent()
           .unwrap()
           .join("index.theme"),
-        "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+        "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\n",
       )
       .unwrap();
       fs::write(icon, []).unwrap();
@@ -1002,7 +885,7 @@ mod tests {
     fs::create_dir_all(icon.parent().unwrap()).unwrap();
     fs::write(
       item_theme.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\n",
     )
     .unwrap();
     fs::write(&icon, []).unwrap();
@@ -1031,177 +914,6 @@ mod tests {
     );
 
     let _ = fs::remove_dir_all(root);
-  }
-
-  #[test]
-  fn theme_dirs_cached() {
-    let root = std::env::temp_dir().join(format!(
-      "alpha-bar-tray-theme-dir-cache-test-{}",
-      std::process::id()
-    ));
-    let item_theme = root.join("item-theme");
-    let icon = item_theme.join("hicolor/scalable/status/input-keyboard.svg");
-    fs::create_dir_all(icon.parent().unwrap()).unwrap();
-    fs::write(
-      item_theme.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
-    )
-    .unwrap();
-    fs::write(&icon, []).unwrap();
-
-    let cache_key = ThemeDirsKey {
-      theme: "hicolor".into(),
-      roots: icon_roots(Some(&item_theme), &[]),
-    };
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        Some(&item_theme),
-        &[],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      Some(icon.clone())
-    );
-    assert!(theme_dirs_cache().lock().unwrap().contains_key(&cache_key));
-
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        Some(&item_theme),
-        &[],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      Some(icon)
-    );
-    assert!(theme_dirs_cache().lock().unwrap().contains_key(&cache_key));
-
-    let _ = fs::remove_dir_all(root);
-  }
-
-  #[test]
-  fn theme_dirs_cache_invalidates_index() {
-    let root = std::env::temp_dir().join(format!(
-      "alpha-bar-tray-theme-dir-invalidate-test-{}",
-      std::process::id()
-    ));
-    let item_theme = root.join("item-theme");
-    let old_icon = item_theme.join("hicolor/scalable/status/input-keyboard.svg");
-    let new_icon = item_theme.join("hicolor/24x24/status/input-keyboard.svg");
-    fs::create_dir_all(old_icon.parent().unwrap()).unwrap();
-    fs::create_dir_all(new_icon.parent().unwrap()).unwrap();
-    fs::write(
-      item_theme.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
-    )
-    .unwrap();
-    fs::write(&old_icon, []).unwrap();
-
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        Some(&item_theme),
-        &[],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      Some(old_icon.clone())
-    );
-
-    fs::remove_file(&old_icon).unwrap();
-    fs::write(
-      item_theme.join("hicolor/index.theme"),
-      "[Icon Theme]\nDirectories=24x24/status\nComment=force different metadata length\n[24x24/status]\nSize=24\nType=Fixed\n",
-    )
-    .unwrap();
-    fs::write(&new_icon, []).unwrap();
-
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        Some(&item_theme),
-        &[],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      Some(new_icon)
-    );
-
-    let _ = fs::remove_dir_all(root);
-  }
-
-  #[test]
-  fn theme_dirs_cache_invalidates_bases() {
-    let root = std::env::temp_dir().join(format!(
-      "alpha-bar-tray-theme-base-invalidate-test-{}",
-      std::process::id()
-    ));
-    let first_index = root.join("first/icons/hicolor/index.theme");
-    let second_icon = root.join("second/icons/hicolor/scalable/status/input-keyboard.svg");
-    fs::create_dir_all(first_index.parent().unwrap()).unwrap();
-    fs::write(
-      &first_index,
-      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
-    )
-    .unwrap();
-
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        None,
-        &[root.join("first"), root.join("second")],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      None
-    );
-
-    fs::create_dir_all(second_icon.parent().unwrap()).unwrap();
-    fs::write(
-      second_icon
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("index.theme"),
-      fs::read_to_string(&first_index).unwrap(),
-    )
-    .unwrap();
-    fs::write(&second_icon, []).unwrap();
-
-    assert_eq!(
-      find_icon_path(
-        "input-keyboard",
-        None,
-        &[root.join("first"), root.join("second")],
-        "hicolor",
-        tray_icon_size(1),
-      ),
-      Some(second_icon)
-    );
-
-    let _ = fs::remove_dir_all(root);
-  }
-
-  #[test]
-  fn theme_index() {
-    let index = parse_theme_index(
-      "[Icon Theme]\nDirectories=scalable/status\nInherits=hicolor\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\nThreshold=3\n",
-    );
-
-    assert_eq!(
-      index.value("Icon Theme", "Directories"),
-      Some("scalable/status")
-    );
-    assert_eq!(index.value("Icon Theme", "Inherits"), Some("hicolor"));
-    assert_eq!(index.value("scalable/status", "Size"), Some("16"));
-    assert_eq!(index.value("scalable/status", "Type"), Some("Scalable"));
-    assert_eq!(index.value("scalable/status", "MinSize"), Some("1"));
-    assert_eq!(index.value("scalable/status", "MaxSize"), Some("64"));
-    assert_eq!(index.value("scalable/status", "Threshold"), Some("3"));
   }
 
   #[test]
@@ -1282,12 +994,12 @@ mod tests {
     fs::create_dir_all(unselected.parent().unwrap()).unwrap();
     fs::write(
       root.join("share/icons/Selected/index.theme"),
-      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\n",
     )
     .unwrap();
     fs::write(
       root.join("share/icons/Other/index.theme"),
-      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\n",
     )
     .unwrap();
     fs::write(&selected, []).unwrap();
@@ -1302,6 +1014,136 @@ mod tests {
         tray_icon_size(1),
       ),
       Some(selected)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_list_dirs() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-compact-theme-test-{}",
+      std::process::id()
+    ));
+    let selected = root.join("share/icons/Selected/24/panel/input-keyboard.svg");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=24/panel\nInherits=hicolor\n[24/panel]\nSize=24\n",
+    )
+    .unwrap();
+    fs::write(&selected, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1),
+      ),
+      Some(selected)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_inherits() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-inherit-theme-test-{}",
+      std::process::id()
+    ));
+    let inherited = root.join("share/icons/Parent/24/panel/input-keyboard.svg");
+    fs::create_dir_all(root.join("share/icons/Selected")).unwrap();
+    fs::create_dir_all(inherited.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=\nInherits=Parent\n",
+    )
+    .unwrap();
+    fs::write(
+      root.join("share/icons/Parent/index.theme"),
+      "[Icon Theme]\nDirectories=24/panel\n[24/panel]\nSize=24\n",
+    )
+    .unwrap();
+    fs::write(&inherited, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1),
+      ),
+      Some(inherited)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_index_cached() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-index-cache-test-{}",
+      std::process::id()
+    ));
+    let icon = root.join("share/icons/Selected/24/panel/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=24/panel\n[24/panel]\nSize=24\n",
+    )
+    .unwrap();
+    fs::write(&icon, []).unwrap();
+    let key = ThemeIndexKey {
+      theme: "Selected".into(),
+      roots: icon_roots(None, &[root.join("share")]),
+    };
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1),
+      ),
+      Some(icon)
+    );
+    assert!(theme_index_cache().lock().unwrap().contains_key(&key));
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_uses_size_score() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-size-score-test-{}",
+      std::process::id()
+    ));
+    let larger = root.join("share/icons/Selected/24/panel/input-keyboard.svg");
+    let closer = root.join("share/icons/Selected/22/panel/input-keyboard.svg");
+    fs::create_dir_all(larger.parent().unwrap()).unwrap();
+    fs::create_dir_all(closer.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=24/panel,22/panel\n[24/panel]\nSize=24\n[22/panel]\nSize=22\n",
+    )
+    .unwrap();
+    fs::write(&larger, []).unwrap();
+    fs::write(&closer, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1),
+      ),
+      Some(closer)
     );
 
     let _ = fs::remove_dir_all(root);

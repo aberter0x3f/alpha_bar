@@ -38,7 +38,7 @@ use crate::{
   runtime::{RuntimeCommand, Update},
   state::{Click, Snapshot, TrayMenuHit, TrayMenuPopup},
   ui::input::click_target_with_origin,
-  ui::layout::{menu_height, menu_hit, menu_width},
+  ui::layout::{menu_height, menu_hit, menu_hover, menu_width},
   ui::render::{render_menu_scaled, render_ui_scaled},
 };
 
@@ -82,6 +82,7 @@ pub fn run(
     scale: 1,
     snapshot,
     menu,
+    menu_hover: None,
     closed: false,
     dirty: false,
     cmd_tx,
@@ -173,6 +174,7 @@ struct BarLayer {
   scale: u32,
   snapshot: Snapshot,
   menu: Option<TrayMenuPopup>,
+  menu_hover: Option<Vec<usize>>,
   closed: bool,
   dirty: bool,
   cmd_tx: Sender<RuntimeCommand>,
@@ -251,10 +253,16 @@ impl PointerHandler for BarLayer {
         .as_ref()
         .is_some_and(|menu_layer| &event.surface == menu_layer.layer.wl_surface())
       {
-        let PointerEventKind::Press { .. } = event.kind else {
-          continue;
-        };
-        self.handle_menu_press(event.position.0, event.position.1);
+        match event.kind {
+          PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+            self.handle_menu_hover(event.position.0, event.position.1);
+          }
+          PointerEventKind::Leave { .. } => self.clear_menu_hover(),
+          PointerEventKind::Press { .. } => {
+            self.handle_menu_press(event.position.0, event.position.1)
+          }
+          _ => {}
+        }
         continue;
       }
       if &event.surface != self.layer.wl_surface() {
@@ -287,6 +295,7 @@ impl BarLayer {
     self.menu_open = size.is_some();
     let Some(menu_surface) = size else {
       self.menu_layer = None;
+      self.menu_hover = None;
       return false;
     };
     if let Some(menu_layer) = &mut self.menu_layer {
@@ -393,6 +402,32 @@ impl BarLayer {
     }
   }
 
+  fn handle_menu_hover(&mut self, x: f64, y: f64) {
+    let Some(menu) = &self.menu else {
+      self.clear_menu_hover();
+      return;
+    };
+    let (x, y) = self
+      .menu_layer
+      .as_ref()
+      .map_or((x, y), |layer| (x + layer.x as f64, y + layer.y as f64));
+    let hover = menu_hover(menu, x, y);
+    if self.menu_hover != hover {
+      self.menu_hover = hover;
+      if let Some(menu_layer) = &mut self.menu_layer {
+        menu_layer.dirty = true;
+      }
+    }
+  }
+
+  fn clear_menu_hover(&mut self) {
+    if self.menu_hover.take().is_some()
+      && let Some(menu_layer) = &mut self.menu_layer
+    {
+      menu_layer.dirty = true;
+    }
+  }
+
   fn draw(&mut self) {
     self.dirty = false;
     let pixels = render_ui_scaled(
@@ -425,6 +460,7 @@ impl BarLayer {
       menu_layer.height as usize,
       self.scale,
       menu,
+      self.menu_hover.as_deref(),
       menu_layer.x as f64,
       menu_layer.y as f64,
     );

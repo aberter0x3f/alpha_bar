@@ -5,6 +5,7 @@ use crate::{
 use std::{fs, sync::mpsc::Sender, thread, time::Duration};
 
 const ICONS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn current(old: &str, new: &str) -> u8 {
   cpu_usage(old, new).unwrap_or(0)
@@ -22,7 +23,7 @@ pub fn spawn(tx: Sender<Update>) {
   thread::spawn(move || {
     let mut old = fs::read_to_string("/proc/stat").unwrap_or_default();
     loop {
-      thread::sleep(Duration::from_secs(5));
+      thread::sleep(UPDATE_INTERVAL);
       let new = fs::read_to_string("/proc/stat").unwrap_or_default();
       let _ = tx.send(Update::Cpu(segment(current(&old, &new))));
       old = new;

@@ -6,6 +6,8 @@ use crate::{
 };
 use std::{sync::mpsc::Sender, thread, time::Duration};
 
+const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
 pub fn current() -> u8 {
   fs::read_to_string("/proc/meminfo")
     .ok()
@@ -21,7 +23,7 @@ pub fn spawn(tx: Sender<Update>) {
   thread::spawn(move || {
     loop {
       let _ = tx.send(Update::Memory(segment(current())));
-      thread::sleep(Duration::from_secs(5));
+      thread::sleep(UPDATE_INTERVAL);
     }
   });
 }

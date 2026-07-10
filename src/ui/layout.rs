@@ -144,6 +144,32 @@ pub(crate) fn menu_hit(menu: &TrayMenuPopup, x: f64, y: f64) -> TrayMenuHit {
   TrayMenuHit::Outside
 }
 
+pub(crate) fn menu_hover(menu: &TrayMenuPopup, x: f64, y: f64) -> Option<Vec<usize>> {
+  if x < menu.x || y < menu.y || x >= menu.x + menu_width(menu) || y >= menu.y + menu_height(menu) {
+    return None;
+  }
+  let mut column_x = menu.x;
+  let mut path = Vec::new();
+  for entries in menu_columns(menu) {
+    let column_width = menu_column_width(entries);
+    if x >= column_x && x < column_x + column_width {
+      let row = ((y - menu.y) / MENU_ROW_HEIGHT) as usize;
+      let entry = entries.get(row)?;
+      if entry.separator {
+        return None;
+      }
+      path.push(row);
+      return Some(path);
+    }
+    let Some(&open_index) = menu.open_path.get(path.len()) else {
+      break;
+    };
+    path.push(open_index);
+    column_x += column_width;
+  }
+  None
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -203,5 +229,38 @@ mod tests {
       menu_hit(&menu, menu_column_width(&menu.entries) + 4.0, 36.0),
       TrayMenuHit::Activate { id: 2 }
     );
+  }
+
+  #[test]
+  fn menu_hover_path() {
+    let menu = TrayMenuPopup {
+      address: ":1.2/StatusNotifierItem".into(),
+      path: "/menu".into(),
+      x: 0.0,
+      y: 32.0,
+      entries: vec![
+        TrayMenuEntry {
+          id: 1,
+          label: "Open".into(),
+          enabled: true,
+          separator: false,
+          icon: None,
+          children: Vec::new(),
+        },
+        TrayMenuEntry {
+          id: 2,
+          label: "Disabled".into(),
+          enabled: false,
+          separator: false,
+          icon: None,
+          children: Vec::new(),
+        },
+      ],
+      open_path: Vec::new(),
+    };
+
+    assert_eq!(menu_hover(&menu, 4.0, 36.0), Some(vec![0]));
+    assert_eq!(menu_hover(&menu, 4.0, 60.0), Some(vec![1]));
+    assert_eq!(menu_hover(&menu, 4.0, 90.0), None);
   }
 }

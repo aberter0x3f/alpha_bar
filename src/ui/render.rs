@@ -37,7 +37,7 @@ pub(crate) fn render_ui_scaled(
   }
 
   if let Some(menu) = menu {
-    draw_menu(&cr, &font, menu);
+    draw_menu(&cr, &font, menu, None);
   }
 
   drop(cr);
@@ -50,6 +50,7 @@ pub(crate) fn render_menu_scaled(
   height: usize,
   scale: u32,
   menu: &TrayMenuPopup,
+  hover_path: Option<&[usize]>,
   origin_x: f64,
   origin_y: f64,
 ) -> Vec<u8> {
@@ -68,14 +69,20 @@ pub(crate) fn render_menu_scaled(
   cr.set_operator(cairo::Operator::Over);
   let font = font_description(STYLE.font);
   cr.translate(-origin_x, -origin_y);
-  draw_menu(&cr, &font, menu);
+  draw_menu(&cr, &font, menu, hover_path);
   drop(cr);
   surface.flush();
   surface.data().expect("read cairo surface").to_vec()
 }
 
-fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenuPopup) {
+fn draw_menu(
+  cr: &cairo::Context,
+  font: &pango::FontDescription,
+  menu: &TrayMenuPopup,
+  hover_path: Option<&[usize]>,
+) {
   let mut x = menu.x;
+  let mut path_prefix = Vec::new();
   for entries in menu_columns(menu) {
     let width = menu_column_width(entries);
     set_color(cr, argb(STYLE.background));
@@ -83,14 +90,21 @@ fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenu
     cr.fill().expect("fill tray menu");
     for (index, entry) in entries.iter().enumerate() {
       let y = menu.y + index as f64 * MENU_ROW_HEIGHT;
+      let mut path = path_prefix.clone();
+      path.push(index);
       if entry.separator {
         set_color(cr, argb(STYLE.border_normal));
         cr.rectangle(x + 8.0, y + 11.0, width - 16.0, 1.0);
         cr.fill().expect("draw tray menu separator");
         continue;
       }
+      if hover_path.is_some_and(|hover| hover == path.as_slice()) {
+        set_color(cr, argb(STYLE.border_normal));
+        cr.rectangle(x, y, width, MENU_ROW_HEIGHT);
+        cr.fill().expect("draw tray menu hover");
+      }
       if let Some(icon) = &entry.icon {
-        draw_icon(cr, x + 4.0, y + 2.0, icon);
+        draw_icon(cr, x + 4.0, centered_y(y, 20.0), icon);
       }
       set_color(
         cr,
@@ -100,21 +114,33 @@ fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenu
           STYLE.border_normal
         }),
       );
-      cr.move_to(x + 32.0, y + 4.0);
       let layout = pangocairo::functions::create_layout(cr);
       layout.set_text(&entry.label);
       layout.set_font_description(Some(font));
+      cr.move_to(x + 32.0, text_y(y, &layout));
       pangocairo::functions::show_layout(cr, &layout);
       if !entry.children.is_empty() {
-        cr.move_to(x + width - 14.0, y + 4.0);
         let layout = pangocairo::functions::create_layout(cr);
         layout.set_text(">");
         layout.set_font_description(Some(font));
+        cr.move_to(x + width - 14.0, text_y(y, &layout));
         pangocairo::functions::show_layout(cr, &layout);
       }
     }
+    if let Some(&open_index) = menu.open_path.get(path_prefix.len()) {
+      path_prefix.push(open_index);
+    }
     x += width;
   }
+}
+
+fn centered_y(row_y: f64, height: f64) -> f64 {
+  row_y + (MENU_ROW_HEIGHT - height) / 2.0
+}
+
+fn text_y(row_y: f64, layout: &pango::Layout) -> f64 {
+  let extents = layout.pixel_extents().1;
+  centered_y(row_y, extents.height() as f64) - extents.y() as f64
 }
 
 fn draw_segment(
@@ -212,5 +238,11 @@ mod tests {
     let pixels = icon_surface_pixels(&icon);
     assert_eq!(pixels, icon.pixels);
     assert_ne!(pixels.as_ptr(), icon.pixels.as_ptr());
+  }
+
+  #[test]
+  fn menu_row_centers_content() {
+    assert_eq!(centered_y(32.0, 20.0), 34.0);
+    assert_eq!(centered_y(32.0, 12.0), 38.0);
   }
 }

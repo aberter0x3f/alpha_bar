@@ -54,14 +54,14 @@ pub fn segment(text: String, class: &str) -> Segment {
   Segment::new(Side::Right, class_from_battery(class), text)
 }
 
-pub fn system_segment(root: &Path) -> Option<Segment> {
+pub fn battery_segment(root: &Path) -> Option<Segment> {
   system_battery(root).map(|battery| segment(battery.text, battery.class))
 }
 
 pub fn spawn(tx: Sender<Update>) {
   thread::spawn(move || {
     loop {
-      let _ = tx.send(Update::Battery(system_segment(Path::new(
+      let _ = tx.send(Update::Battery(battery_segment(Path::new(
         "/sys/class/power_supply",
       ))));
       thread::sleep(Duration::from_secs(5));
@@ -152,7 +152,7 @@ mod tests {
     fs::create_dir_all(&mains).unwrap();
     fs::write(mains.join("type"), "Mains\n").unwrap();
 
-    assert_eq!(system_segment(&root), None);
+    assert_eq!(battery_segment(&root), None);
 
     let _ = fs::remove_dir_all(root);
   }
