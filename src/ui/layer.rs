@@ -35,14 +35,15 @@ use wayland_client::{
 use crate::{
   app::build_segments,
   config::BAR,
-  runtime::{RuntimeCommand, RuntimeState, Update},
-  state::{Click, Segment, TrayMenuHit, TrayMenuPopup},
+  runtime::{RuntimeCommand, Update},
+  state::{Click, Segment, Snapshot, TrayMenuHit, TrayMenuPopup},
   ui::input::click_target_with_origin,
+  ui::layout::menu_hit,
   ui::render::{render_menu_scaled, render_ui_scaled},
 };
 
 pub fn run(
-  mut state: RuntimeState,
+  mut snapshot: Snapshot,
   rx: Receiver<Update>,
   cmd_tx: Sender<RuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -78,8 +79,8 @@ pub fn run(
     height: BAR.height,
     menu_open: false,
     scale: 1,
-    segments: segments_from_state(&state),
-    menu: state.snapshot().tray_menu.clone(),
+    segments: build_segments(&snapshot),
+    menu: snapshot.tray_menu.clone(),
     closed: false,
     dirty: false,
     cmd_tx,
@@ -94,20 +95,8 @@ pub fn run(
   queue.flush()?;
   while !bar.closed {
     queue.dispatch_pending(&mut bar)?;
-    let mut dirty = false;
-    while let Ok(update) = rx.try_recv() {
-      state.apply(update);
-      dirty = true;
-    }
-    if dirty || bar.dirty {
-      bar.segments = segments_from_state(&state);
-      bar.menu = merge_menu(bar.menu.take(), state.snapshot().tray_menu.clone());
-      let created_menu_layer = bar.sync_menu_layer(&qh, state.snapshot().tray_menu.is_some());
-      if !created_menu_layer && let Some(menu_layer) = &mut bar.menu_layer {
-        menu_layer.dirty = true;
-      }
-      bar.draw();
-      bar.draw_menu();
+    let dirty = drain_updates(&mut snapshot, &rx);
+    if bar.redraw_dirty(&qh, &snapshot, dirty) {
       queue.flush()?;
     } else if bar.menu_layer.as_ref().is_some_and(|layer| layer.dirty) {
       bar.draw_menu();
@@ -123,6 +112,15 @@ pub fn run(
     }
   }
   Ok(())
+}
+
+fn drain_updates(snapshot: &mut Snapshot, rx: &Receiver<Update>) -> bool {
+  let mut dirty = false;
+  while let Ok(update) = rx.try_recv() {
+    snapshot.apply(update);
+    dirty = true;
+  }
+  dirty
 }
 
 fn fd_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> io::Result<bool> {
@@ -141,10 +139,6 @@ fn fd_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> io::Result<bool> {
       return Err(error);
     }
   }
-}
-
-fn segments_from_state(state: &RuntimeState) -> Vec<Segment> {
-  build_segments(state.snapshot())
 }
 
 fn merge_menu(
@@ -258,38 +252,27 @@ impl PointerHandler for BarLayer {
       let PointerEventKind::Press { button, .. } = event.kind else {
         continue;
       };
-      let context_menu = match button {
-        BTN_LEFT => false,
-        BTN_RIGHT => true,
-        _ => continue,
-      };
-      match click_target_with_origin(
-        self.width as usize,
-        BAR.height as usize,
-        event.position.0,
-        event.position.1,
-        &self.segments,
-        self.menu.as_ref(),
-      ) {
-        Some((Click::Tray(address), menu_x)) => {
-          let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
-            address,
-            context_menu,
-            x: event.position.0.round() as i32,
-            y: event.position.1.round() as i32,
-            menu_x: menu_x.round() as i32,
-          });
-        }
-        None if self.menu_open => {
-          let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
-        }
-        None => {}
-      }
+      self.handle_bar_press(button, event.position.0, event.position.1);
     }
   }
 }
 
 impl BarLayer {
+  fn redraw_dirty(&mut self, qh: &QueueHandle<Self>, snapshot: &Snapshot, dirty: bool) -> bool {
+    if !(dirty || self.dirty) {
+      return false;
+    }
+    self.segments = build_segments(snapshot);
+    self.menu = merge_menu(self.menu.take(), snapshot.tray_menu.clone());
+    let created_menu_layer = self.sync_menu_layer(qh, snapshot.tray_menu.is_some());
+    if !created_menu_layer && let Some(menu_layer) = &mut self.menu_layer {
+      menu_layer.dirty = true;
+    }
+    self.draw();
+    self.draw_menu();
+    true
+  }
+
   fn sync_menu_layer(&mut self, qh: &QueueHandle<Self>, open: bool) -> bool {
     self.menu_open = open;
     if !open {
@@ -321,12 +304,41 @@ impl BarLayer {
     true
   }
 
+  fn handle_bar_press(&mut self, button: u32, x: f64, y: f64) {
+    let context_menu = match button {
+      BTN_LEFT => false,
+      BTN_RIGHT => true,
+      _ => return,
+    };
+    match click_target_with_origin(
+      self.width as usize,
+      BAR.height as usize,
+      x,
+      y,
+      &self.segments,
+    ) {
+      Some((Click::Tray(address), menu_x)) => {
+        let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
+          address,
+          context_menu,
+          x: x.round() as i32,
+          y: y.round() as i32,
+          menu_x: menu_x.round() as i32,
+        });
+      }
+      None if self.menu_open => {
+        let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
+      }
+      None => {}
+    }
+  }
+
   fn handle_menu_press(&mut self, x: f64, y: f64) {
     let Some(menu) = self.menu.as_mut() else {
       let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
       return;
     };
-    match menu.hit(x, y) {
+    match menu_hit(menu, x, y) {
       TrayMenuHit::Activate { id } => {
         let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
           address: menu.address.clone(),
@@ -348,18 +360,6 @@ impl BarLayer {
 
   fn draw(&mut self) {
     self.dirty = false;
-    let buffer_width = self.width * self.scale;
-    let buffer_height = self.height * self.scale;
-    let stride = buffer_width as i32 * 4;
-    let (buffer, canvas) = self
-      .pool
-      .create_buffer(
-        buffer_width as i32,
-        buffer_height as i32,
-        stride,
-        wl_shm::Format::Argb8888,
-      )
-      .expect("create wayland buffer");
     let pixels = render_ui_scaled(
       self.width as usize,
       self.height as usize,
@@ -367,16 +367,14 @@ impl BarLayer {
       &self.segments,
       None,
     );
-    copy_pixels(canvas, &pixels);
-    self.layer.wl_surface().set_buffer_scale(self.scale as i32);
-    self
-      .layer
-      .wl_surface()
-      .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
-    buffer
-      .attach_to(self.layer.wl_surface())
-      .expect("attach wayland buffer");
-    self.layer.commit();
+    paint_surface(
+      &mut self.pool,
+      &self.layer,
+      self.width,
+      self.height,
+      self.scale,
+      &pixels,
+    );
   }
 
   fn draw_menu(&mut self) {
@@ -387,38 +385,51 @@ impl BarLayer {
       return;
     }
     menu_layer.dirty = false;
-    let buffer_width = menu_layer.width * self.scale;
-    let buffer_height = menu_layer.height * self.scale;
-    let stride = buffer_width as i32 * 4;
-    let (buffer, canvas) = self
-      .pool
-      .create_buffer(
-        buffer_width as i32,
-        buffer_height as i32,
-        stride,
-        wl_shm::Format::Argb8888,
-      )
-      .expect("create wayland buffer");
     let pixels = render_menu_scaled(
       menu_layer.width as usize,
       menu_layer.height as usize,
       self.scale,
       menu,
     );
-    copy_pixels(canvas, &pixels);
-    menu_layer
-      .layer
-      .wl_surface()
-      .set_buffer_scale(self.scale as i32);
-    menu_layer
-      .layer
-      .wl_surface()
-      .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
-    buffer
-      .attach_to(menu_layer.layer.wl_surface())
-      .expect("attach wayland buffer");
-    menu_layer.layer.commit();
+    paint_surface(
+      &mut self.pool,
+      &menu_layer.layer,
+      menu_layer.width,
+      menu_layer.height,
+      self.scale,
+      &pixels,
+    );
   }
+}
+
+fn paint_surface(
+  pool: &mut SlotPool,
+  layer: &LayerSurface,
+  width: u32,
+  height: u32,
+  scale: u32,
+  pixels: &[u8],
+) {
+  let buffer_width = width * scale;
+  let buffer_height = height * scale;
+  let stride = buffer_width as i32 * 4;
+  let (buffer, canvas) = pool
+    .create_buffer(
+      buffer_width as i32,
+      buffer_height as i32,
+      stride,
+      wl_shm::Format::Argb8888,
+    )
+    .expect("create wayland buffer");
+  copy_pixels(canvas, pixels);
+  layer.wl_surface().set_buffer_scale(scale as i32);
+  layer
+    .wl_surface()
+    .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
+  buffer
+    .attach_to(layer.wl_surface())
+    .expect("attach wayland buffer");
+  layer.commit();
 }
 
 fn copy_pixels(canvas: &mut [u8], pixels: &[u8]) {

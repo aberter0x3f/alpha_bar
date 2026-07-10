@@ -1,7 +1,7 @@
-pub mod app;
-pub mod config;
-pub mod modules;
+pub(crate) mod app;
+pub(crate) mod config;
+pub(crate) mod modules;
 pub mod runtime;
 pub mod state;
-pub mod style;
+pub(crate) mod style;
 pub mod ui;

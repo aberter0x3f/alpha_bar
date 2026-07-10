@@ -9,7 +9,7 @@ pub fn underline(class: Class) -> &'static str {
   }
 }
 
-pub fn argb(hex: &str) -> u32 {
+pub(crate) fn argb(hex: &str) -> u32 {
   let Some(raw) = hex.strip_prefix('#') else {
     return 0xff000000;
   };
@@ -17,4 +17,15 @@ pub fn argb(hex: &str) -> u32 {
     return 0xff000000;
   }
   u32::from_str_radix(raw, 16).map_or(0xff000000, |rgb| 0xff000000 | rgb)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn hex_argb() {
+    assert_eq!(argb("#3b4252"), 0xff3b4252);
+    assert_eq!(argb("bad"), 0xff000000);
+  }
 }

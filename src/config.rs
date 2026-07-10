@@ -1,7 +1,5 @@
 pub struct BarConfig {
   pub height: u32,
-  pub position: &'static str,
-  pub layer: &'static str,
 }
 
 pub struct StyleConfig {
@@ -14,11 +12,7 @@ pub struct StyleConfig {
   pub border_critical: &'static str,
 }
 
-pub const BAR: BarConfig = BarConfig {
-  height: 32,
-  position: "top",
-  layer: "top",
-};
+pub const BAR: BarConfig = BarConfig { height: 32 };
 
 pub const STYLE: StyleConfig = StyleConfig {
   font: "SarasaMonoSC Nerd Font",

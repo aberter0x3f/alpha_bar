@@ -36,49 +36,39 @@ pub enum RuntimeCommand {
   TrayScale(u32),
 }
 
-pub struct RuntimeState {
-  snapshot: Snapshot,
-}
-
-impl Default for RuntimeState {
+impl Default for Snapshot {
   fn default() -> Self {
-    Self {
-      snapshot: Snapshot {
-        workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
-        tray: Vec::new(),
-        tray_menu: None,
-        network: network::segment("󰲛 Disconnected".into()),
-        net_speed: net_speed::default_segment(),
-        audio: audio::segment("󰖁 0%".into()),
-        cpu: cpu::segment(0),
-        memory: memory::segment(0),
-        temperature: temperature::segment(0),
-        battery: None,
-        clock: clock::segment(clock::clock_text(0, 0)),
-      },
+    Snapshot {
+      workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
+      tray: Vec::new(),
+      tray_menu: None,
+      network: network::segment("󰲛 Disconnected".into()),
+      net_speed: net_speed::default_segment(),
+      audio: audio::segment("󰖁 0%".into()),
+      cpu: cpu::segment(0),
+      memory: memory::segment(0),
+      temperature: temperature::segment(0),
+      battery: None,
+      clock: clock::segment(clock::clock_text(0, 0)),
     }
   }
 }
 
-impl RuntimeState {
+impl Snapshot {
   pub fn apply(&mut self, update: Update) {
     match update {
-      Update::Workspaces(v) => self.snapshot.workspaces = v,
-      Update::Tray(v) => self.snapshot.tray = v,
-      Update::TrayMenu(v) => self.snapshot.tray_menu = v,
-      Update::Network(v) => self.snapshot.network = v,
-      Update::NetSpeed(v) => self.snapshot.net_speed = v,
-      Update::Audio(v) => self.snapshot.audio = v,
-      Update::Cpu(v) => self.snapshot.cpu = v,
-      Update::Memory(v) => self.snapshot.memory = v,
-      Update::Temperature(v) => self.snapshot.temperature = v,
-      Update::Battery(v) => self.snapshot.battery = v,
-      Update::Clock(v) => self.snapshot.clock = v,
+      Update::Workspaces(v) => self.workspaces = v,
+      Update::Tray(v) => self.tray = v,
+      Update::TrayMenu(v) => self.tray_menu = v,
+      Update::Network(v) => self.network = v,
+      Update::NetSpeed(v) => self.net_speed = v,
+      Update::Audio(v) => self.audio = v,
+      Update::Cpu(v) => self.cpu = v,
+      Update::Memory(v) => self.memory = v,
+      Update::Temperature(v) => self.temperature = v,
+      Update::Battery(v) => self.battery = v,
+      Update::Clock(v) => self.clock = v,
     }
-  }
-
-  pub fn snapshot(&self) -> &Snapshot {
-    &self.snapshot
   }
 }
 
@@ -93,4 +83,40 @@ pub fn spawn_workers(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
   niri::spawn(tx.clone());
   tray::spawn(tx.clone(), cmd_rx);
   cpu::spawn(tx);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    modules::{audio, cpu, power},
+    state::{Class, Side},
+  };
+
+  #[test]
+  fn independent_updates() {
+    let mut snapshot = Snapshot::default();
+    snapshot.apply(Update::Audio(audio::segment("󰖁 0%".into())));
+    snapshot.apply(Update::Workspaces(vec![
+      Segment::new(Side::Left, Class::Normal, "1"),
+      Segment::new(Side::Left, Class::Active, "2"),
+    ]));
+    snapshot.apply(Update::Tray(vec![Segment::new(
+      Side::Left,
+      Class::Normal,
+      "tray",
+    )]));
+    snapshot.apply(Update::Cpu(cpu::segment(88)));
+    snapshot.apply(Update::Battery(Some(power::segment(
+      "󰂎 9%".into(),
+      "critical",
+    ))));
+
+    assert_eq!(snapshot.audio.text, "󰖁 0%");
+    assert_eq!(snapshot.workspaces[1].class, Class::Active);
+    assert_eq!(snapshot.tray[0].text, "tray");
+    assert_eq!(snapshot.cpu.text, "█ 88%");
+    assert_eq!(snapshot.battery.as_ref().unwrap().text, "󰂎 9%");
+    assert_eq!(snapshot.memory.text, "󰍛 0%");
+  }
 }

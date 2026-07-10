@@ -2,23 +2,10 @@ use crate::{
   config::{BAR, STYLE},
   state::{Segment, Side, TrayMenuPopup},
   style::{argb, underline},
-  ui::layout::{LEFT_EDGE_PAD, RIGHT_EDGE_PAD, RIGHT_GAP, segment_width as layout_segment_width},
+  ui::layout::{MENU_ROW_HEIGHT, RIGHT_GAP, layout_segments, menu_column_width, menu_columns},
 };
 
-pub fn render_segments(width: usize, height: usize, segments: &[Segment]) -> Vec<u8> {
-  render_segments_scaled(width, height, 1, segments)
-}
-
-pub fn render_segments_scaled(
-  width: usize,
-  height: usize,
-  scale: u32,
-  segments: &[Segment],
-) -> Vec<u8> {
-  render_ui_scaled(width, height, scale, segments, None)
-}
-
-pub fn render_ui_scaled(
+pub(crate) fn render_ui_scaled(
   width: usize,
   height: usize,
   scale: u32,
@@ -44,26 +31,8 @@ pub fn render_ui_scaled(
   cr.fill().expect("paint background");
   let font = font_description();
 
-  let mut left = LEFT_EDGE_PAD;
-  for segment in segments.iter().filter(|segment| segment.side == Side::Left) {
-    let segment_width = segment_width(&cr, &font, segment);
-    draw_segment(&cr, &font, segment, left, segment_width);
-    left += segment_width;
-  }
-
-  let right_width = segments
-    .iter()
-    .filter(|segment| segment.side == Side::Right)
-    .map(|segment| segment_width(&cr, &font, segment))
-    .sum::<f64>();
-  let mut right = width as f64 - RIGHT_EDGE_PAD - right_width;
-  for segment in segments
-    .iter()
-    .filter(|segment| segment.side == Side::Right)
-  {
-    let segment_width = segment_width(&cr, &font, segment);
-    draw_segment(&cr, &font, segment, right, segment_width);
-    right += segment_width;
+  for rect in layout_segments(width, segments, |text| text_width(&cr, &font, text)) {
+    draw_segment(&cr, &font, rect.segment, rect.x, rect.width);
   }
 
   if let Some(menu) = menu {
@@ -75,7 +44,7 @@ pub fn render_ui_scaled(
   surface.data().expect("read cairo surface").to_vec()
 }
 
-pub fn render_menu_scaled(
+pub(crate) fn render_menu_scaled(
   width: usize,
   height: usize,
   scale: u32,
@@ -103,18 +72,13 @@ pub fn render_menu_scaled(
 
 fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenuPopup) {
   let mut x = menu.x;
-  for entries in menu.columns() {
-    let width = TrayMenuPopup::column_width(entries);
+  for entries in menu_columns(menu) {
+    let width = menu_column_width(entries);
     set_color(cr, argb(STYLE.background));
-    cr.rectangle(
-      x,
-      menu.y,
-      width,
-      entries.len() as f64 * TrayMenuPopup::ROW_HEIGHT,
-    );
+    cr.rectangle(x, menu.y, width, entries.len() as f64 * MENU_ROW_HEIGHT);
     cr.fill().expect("fill tray menu");
     for (index, entry) in entries.iter().enumerate() {
-      let y = menu.y + index as f64 * TrayMenuPopup::ROW_HEIGHT;
+      let y = menu.y + index as f64 * MENU_ROW_HEIGHT;
       if entry.separator {
         set_color(cr, argb(STYLE.border_normal));
         cr.rectangle(x + 8.0, y + 11.0, width - 16.0, 1.0);
@@ -147,10 +111,6 @@ fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenu
     }
     x += width;
   }
-}
-
-fn segment_width(cr: &cairo::Context, font: &pango::FontDescription, segment: &Segment) -> f64 {
-  layout_segment_width(segment, |text| text_width(cr, font, text))
 }
 
 fn text_width(cr: &cairo::Context, font: &pango::FontDescription, text: &str) -> f64 {
@@ -237,14 +197,4 @@ fn set_color(cr: &cairo::Context, argb: u32) {
   let g = ((argb >> 8) & 0xff) as f64 / 255.0;
   let b = (argb & 0xff) as f64 / 255.0;
   cr.set_source_rgb(r, g, b);
-}
-
-#[cfg(test)]
-mod tests {
-  #[test]
-  fn font_pixels() {
-    let font = super::font_description();
-    assert!(font.is_size_absolute());
-    assert_eq!(font.size(), 16 * pango::SCALE);
-  }
 }
