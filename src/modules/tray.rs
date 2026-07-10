@@ -3,7 +3,10 @@ use std::{
   fs::{self, File},
   io::Cursor,
   path::{Path, PathBuf},
-  sync::mpsc::{self, Receiver, Sender},
+  sync::{
+    Mutex, OnceLock,
+    mpsc::{self, Receiver, Sender},
+  },
   thread,
   time::{SystemTime, UNIX_EPOCH},
 };
@@ -624,19 +627,34 @@ fn icon_from_surface(surface: ImageSurface) -> Option<Icon> {
 }
 
 fn icon_from_path(path: &Path) -> Option<Icon> {
-  match path.extension().and_then(|extension| extension.to_str()) {
+  let metadata = fs::metadata(path).ok()?;
+  let modified = metadata.modified().ok();
+  let len = metadata.len();
+  if let Some(cached) = icon_render_cache().lock().ok()?.get(path).cloned()
+    && cached.modified == modified
+    && cached.len == len
+  {
+    return Some(cached.icon);
+  }
+  let icon = match path.extension().and_then(|extension| extension.to_str()) {
     Some("png") => icon_from_png(path),
     Some("svg") => icon_from_svg(path),
     _ => None,
-  }
+  }?;
+  icon_render_cache().lock().ok()?.insert(
+    path.to_path_buf(),
+    CachedIcon {
+      modified,
+      len,
+      icon: icon.clone(),
+    },
+  );
+  Some(icon)
 }
 
 fn icon_from_svg(path: &Path) -> Option<Icon> {
-  let mut options = resvg::usvg::Options {
-    resources_dir: path.parent().map(Path::to_path_buf),
-    ..resvg::usvg::Options::default()
-  };
-  options.fontdb_mut().load_system_fonts();
+  let mut options = resvg::usvg::Options::default();
+  options.resources_dir = path.parent().map(Path::to_path_buf);
   let data = fs::read(path).ok()?;
   let tree = resvg::usvg::Tree::from_data(&data, &options).ok()?;
   let size = tree.size().to_int_size();
@@ -665,14 +683,61 @@ fn find_icon_path(
   xdg_data_roots: &[PathBuf],
   theme: &str,
 ) -> Option<PathBuf> {
+  let key = IconPathKey {
+    name: icon_name.to_owned(),
+    xdg_data_roots: xdg_data_roots.to_vec(),
+    theme: theme.to_owned(),
+  };
+  let cached_path = if item_theme_path.is_none() {
+    icon_path_cache().lock().ok()?.get(&key).cloned()
+  } else {
+    None
+  };
+  if let Some(path) = cached_path {
+    if path.exists() {
+      return Some(path);
+    }
+    let _ = icon_path_cache().lock().ok()?.remove(&key);
+  }
   let icon_roots = icon_roots(item_theme_path, xdg_data_roots);
-  lookup_theme(icon_name, 20, 1, theme, &icon_roots, &mut Vec::new())
+  let path = lookup_theme(icon_name, 20, 1, theme, &icon_roots, &mut Vec::new())
     .or_else(|| {
       (theme != "hicolor")
         .then(|| lookup_theme(icon_name, 20, 1, "hicolor", &icon_roots, &mut Vec::new()))
         .flatten()
     })
-    .or_else(|| lookup_fallback(icon_name, item_theme_path, xdg_data_roots))
+    .or_else(|| lookup_fallback(icon_name, item_theme_path, xdg_data_roots));
+  if item_theme_path.is_none()
+    && let Some(path) = &path
+  {
+    icon_path_cache().lock().ok()?.insert(key, path.clone());
+  }
+  path
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct IconPathKey {
+  name: String,
+  xdg_data_roots: Vec<PathBuf>,
+  theme: String,
+}
+
+#[derive(Clone)]
+struct CachedIcon {
+  modified: Option<SystemTime>,
+  len: u64,
+  icon: Icon,
+}
+
+static ICON_PATH_CACHE: OnceLock<Mutex<HashMap<IconPathKey, PathBuf>>> = OnceLock::new();
+static ICON_RENDER_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIcon>>> = OnceLock::new();
+
+fn icon_path_cache() -> &'static Mutex<HashMap<IconPathKey, PathBuf>> {
+  ICON_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn icon_render_cache() -> &'static Mutex<HashMap<PathBuf, CachedIcon>> {
+  ICON_RENDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn icon_roots(item_theme_path: Option<&Path>, xdg_data_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -715,12 +780,14 @@ fn lookup_theme(
     })
 }
 
+#[derive(Clone)]
 struct ThemeDirs {
   bases: Vec<PathBuf>,
   dirs: Vec<IconDir>,
   inherits: Vec<String>,
 }
 
+#[derive(Clone)]
 struct IconDir {
   name: String,
   size: u32,
@@ -731,6 +798,7 @@ struct IconDir {
   kind: DirKind,
 }
 
+#[derive(Clone, Copy)]
 enum DirKind {
   Fixed,
   Scalable,
@@ -738,6 +806,10 @@ enum DirKind {
 }
 
 fn theme_dirs(theme: &str, roots: &[PathBuf]) -> Option<ThemeDirs> {
+  let cache_key = ThemeDirsKey {
+    theme: theme.to_owned(),
+    roots: roots.to_vec(),
+  };
   let bases = roots
     .iter()
     .map(|root| root.join(theme))
@@ -747,26 +819,113 @@ fn theme_dirs(theme: &str, roots: &[PathBuf]) -> Option<ThemeDirs> {
     .iter()
     .map(|base| base.join("index.theme"))
     .find(|path| path.exists())?;
-  let text = fs::read_to_string(index).ok()?;
-  let dirs = key(&text, "Icon Theme", "Directories")
+  let metadata = fs::metadata(&index).ok()?;
+  let modified = metadata.modified().ok();
+  let len = metadata.len();
+  if let Some(cached) = theme_dirs_cache().lock().ok()?.get(&cache_key).cloned()
+    && cached.index == index
+    && cached.modified == modified
+    && cached.len == len
+    && cached.dirs.bases == bases
+  {
+    return Some(cached.dirs);
+  }
+  let index_text = fs::read_to_string(&index).ok()?;
+  let parsed = parse_theme_index(&index_text);
+  let dirs = parsed
+    .value("Icon Theme", "Directories")
     .into_iter()
-    .chain(key(&text, "Icon Theme", "ScaledDirectories"))
+    .chain(parsed.value("Icon Theme", "ScaledDirectories"))
     .flat_map(|value| split_list(&value))
-    .filter_map(|name| icon_dir(&text, &name))
+    .filter_map(|name| icon_dir(&parsed, &name))
     .collect();
-  Some(ThemeDirs {
+  let theme_dirs = ThemeDirs {
     bases,
     dirs,
-    inherits: key(&text, "Icon Theme", "Inherits").map_or_else(Vec::new, |v| split_list(&v)),
-  })
+    inherits: parsed
+      .value("Icon Theme", "Inherits")
+      .map_or_else(Vec::new, split_list),
+  };
+  theme_dirs_cache().lock().ok()?.insert(
+    cache_key,
+    CachedThemeDirs {
+      index,
+      modified,
+      len,
+      dirs: theme_dirs.clone(),
+    },
+  );
+  Some(theme_dirs)
 }
 
-fn icon_dir(text: &str, name: &str) -> Option<IconDir> {
-  let size = key(text, name, "Size")?.parse().ok()?;
-  let scale = key(text, name, "Scale")
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct ThemeDirsKey {
+  theme: String,
+  roots: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+struct CachedThemeDirs {
+  index: PathBuf,
+  modified: Option<SystemTime>,
+  len: u64,
+  dirs: ThemeDirs,
+}
+
+static THEME_DIRS_CACHE: OnceLock<Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>>> = OnceLock::new();
+
+fn theme_dirs_cache() -> &'static Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>> {
+  THEME_DIRS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn theme_dirs_cache_len() -> usize {
+  theme_dirs_cache().lock().map_or(0, |cache| cache.len())
+}
+
+struct ThemeIndex {
+  values: HashMap<(String, String), String>,
+}
+
+impl ThemeIndex {
+  fn value(&self, section: &str, name: &str) -> Option<&str> {
+    self
+      .values
+      .get(&(section.to_owned(), name.to_owned()))
+      .map(String::as_str)
+  }
+}
+
+fn parse_theme_index(text: &str) -> ThemeIndex {
+  let mut section = String::new();
+  let mut values = HashMap::new();
+  for line in text.lines() {
+    let line = line.trim();
+    if line.starts_with('[') && line.ends_with(']') {
+      section.clear();
+      section.push_str(&line[1..line.len() - 1]);
+      continue;
+    }
+    if line.is_empty() || line.starts_with('#') {
+      continue;
+    }
+    if let Some((key, value)) = line.split_once('=') {
+      values.insert(
+        (section.clone(), key.trim().to_owned()),
+        value.trim().to_owned(),
+      );
+    }
+  }
+  ThemeIndex { values }
+}
+
+fn icon_dir(index: &ThemeIndex, name: &str) -> Option<IconDir> {
+  let size = index.value(name, "Size")?.parse().ok()?;
+  let scale = index
+    .value(name, "Scale")
     .and_then(|v| v.parse().ok())
     .unwrap_or(1);
-  let kind = match key(text, name, "Type").as_deref() {
+  let kind = match index.value(name, "Type") {
     Some("Fixed") => DirKind::Fixed,
     Some("Scalable") => DirKind::Scalable,
     _ => DirKind::Threshold,
@@ -775,13 +934,16 @@ fn icon_dir(text: &str, name: &str) -> Option<IconDir> {
     name: name.to_owned(),
     size,
     scale,
-    min: key(text, name, "MinSize")
+    min: index
+      .value(name, "MinSize")
       .and_then(|v| v.parse().ok())
       .unwrap_or(size),
-    max: key(text, name, "MaxSize")
+    max: index
+      .value(name, "MaxSize")
       .and_then(|v| v.parse().ok())
       .unwrap_or(size),
-    threshold: key(text, name, "Threshold")
+    threshold: index
+      .value(name, "Threshold")
       .and_then(|v| v.parse().ok())
       .unwrap_or(2),
     kind,
@@ -867,23 +1029,6 @@ fn lookup_fallback(
     })
 }
 
-fn key(text: &str, section: &str, name: &str) -> Option<String> {
-  let mut in_section = false;
-  for line in text.lines().map(str::trim) {
-    if line.starts_with('[') && line.ends_with(']') {
-      in_section = &line[1..line.len() - 1] == section;
-      continue;
-    }
-    if in_section
-      && let Some((k, v)) = line.split_once('=')
-      && k.trim() == name
-    {
-      return Some(v.trim().to_owned());
-    }
-  }
-  None
-}
-
 fn split_list(value: &str) -> Vec<String> {
   value
     .split(',')
@@ -963,6 +1108,284 @@ mod tests {
     assert_eq!(rendered.width, 2);
     assert_eq!(rendered.height, 1);
     assert_eq!(rendered.pixels, [0, 0, 255, 255, 0, 0, 255, 255]);
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn icon_path_cached() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-path-cache-test-{}",
+      std::process::id()
+    ));
+    let icon = root.join("share/icons/Selected/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(&icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", None, &[root.join("share")], "Selected"),
+      Some(icon.clone())
+    );
+    assert_eq!(
+      find_icon_path("input-keyboard", None, &[root.join("share")], "Selected"),
+      Some(icon)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn icon_path_cache_invalidates_missing_file() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-path-stale-test-{}",
+      std::process::id()
+    ));
+    let first = root.join("first/icons/Selected/scalable/status/input-keyboard.svg");
+    let second = root.join("second/icons/Selected/scalable/status/input-keyboard.svg");
+    for icon in [&first, &second] {
+      fs::create_dir_all(icon.parent().unwrap()).unwrap();
+      fs::write(
+        icon
+          .parent()
+          .unwrap()
+          .parent()
+          .unwrap()
+          .parent()
+          .unwrap()
+          .join("index.theme"),
+        "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+      )
+      .unwrap();
+      fs::write(icon, []).unwrap();
+    }
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("first"), root.join("second")],
+        "Selected",
+      ),
+      Some(first.clone())
+    );
+    fs::remove_file(first).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("first"), root.join("second")],
+        "Selected",
+      ),
+      Some(second)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn item_theme_path_not_cached() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-item-path-test-{}",
+      std::process::id()
+    ));
+    let item_theme = root.join("item-theme");
+    let icon = item_theme.join("hicolor/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      item_theme.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(&icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      Some(icon)
+    );
+    fs::remove_dir_all(&item_theme).unwrap();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      None
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_dirs_cached() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-theme-dir-cache-test-{}",
+      std::process::id()
+    ));
+    let item_theme = root.join("item-theme");
+    let icon = item_theme.join("hicolor/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      item_theme.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(&icon, []).unwrap();
+
+    let before = theme_dirs_cache_len();
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      Some(icon.clone())
+    );
+    let cached = theme_dirs_cache_len();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      Some(icon)
+    );
+    assert!(cached > before);
+    assert_eq!(theme_dirs_cache_len(), cached);
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_dirs_cache_invalidates_index() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-theme-dir-invalidate-test-{}",
+      std::process::id()
+    ));
+    let item_theme = root.join("item-theme");
+    let old_icon = item_theme.join("hicolor/scalable/status/input-keyboard.svg");
+    let new_icon = item_theme.join("hicolor/24x24/status/input-keyboard.svg");
+    fs::create_dir_all(old_icon.parent().unwrap()).unwrap();
+    fs::create_dir_all(new_icon.parent().unwrap()).unwrap();
+    fs::write(
+      item_theme.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(&old_icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      Some(old_icon.clone())
+    );
+
+    fs::remove_file(&old_icon).unwrap();
+    fs::write(
+      item_theme.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=24x24/status\nComment=force different metadata length\n[24x24/status]\nSize=24\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&new_icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      Some(new_icon)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_dirs_cache_invalidates_bases() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-theme-base-invalidate-test-{}",
+      std::process::id()
+    ));
+    let first_index = root.join("first/icons/hicolor/index.theme");
+    let second_icon = root.join("second/icons/hicolor/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(first_index.parent().unwrap()).unwrap();
+    fs::write(
+      &first_index,
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("first"), root.join("second")],
+        "hicolor",
+      ),
+      None
+    );
+
+    fs::create_dir_all(second_icon.parent().unwrap()).unwrap();
+    fs::write(
+      second_icon
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("index.theme"),
+      fs::read_to_string(&first_index).unwrap(),
+    )
+    .unwrap();
+    fs::write(&second_icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("first"), root.join("second")],
+        "hicolor",
+      ),
+      Some(second_icon)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn theme_index() {
+    let index = parse_theme_index(
+      "[Icon Theme]\nDirectories=scalable/status\nInherits=hicolor\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\nThreshold=3\n",
+    );
+
+    assert_eq!(
+      index.value("Icon Theme", "Directories"),
+      Some("scalable/status")
+    );
+    assert_eq!(index.value("Icon Theme", "Inherits"), Some("hicolor"));
+    assert_eq!(index.value("scalable/status", "Size"), Some("16"));
+    assert_eq!(index.value("scalable/status", "Type"), Some("Scalable"));
+    assert_eq!(index.value("scalable/status", "MinSize"), Some("1"));
+    assert_eq!(index.value("scalable/status", "MaxSize"), Some("64"));
+    assert_eq!(index.value("scalable/status", "Threshold"), Some("3"));
+  }
+
+  #[test]
+  fn icon_render_refreshes_changed_file() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-render-cache-test-{}",
+      std::process::id()
+    ));
+    let icon = root.join("hicolor/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      &icon,
+      r##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#00ff00"/></svg>"##,
+    )
+    .unwrap();
+
+    let rendered = icon_from_path(&icon).unwrap();
+    fs::write(
+      &icon,
+      r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="#ff0000"/></svg>"##,
+    )
+    .unwrap();
+    let updated = icon_from_path(&icon).unwrap();
+
+    assert_ne!(updated, rendered);
+    assert_eq!(updated.width, 2);
+    assert_eq!(updated.pixels, [0, 0, 255, 255, 0, 0, 255, 255]);
 
     let _ = fs::remove_dir_all(root);
   }

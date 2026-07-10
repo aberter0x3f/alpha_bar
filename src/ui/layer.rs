@@ -272,6 +272,7 @@ impl BarLayer {
   fn set_menu_open(&mut self, open: bool) -> bool {
     if self.menu_open != open {
       self.menu_open = open;
+      self.layer.set_layer(menu_layer(open));
       if open {
         self
           .layer
@@ -283,7 +284,7 @@ impl BarLayer {
           .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
         self.layer.set_size(0, BAR.height);
       }
-      self.layer.set_exclusive_zone(BAR.height as i32);
+      self.layer.set_exclusive_zone(exclusive_zone(open));
       self.layer.commit();
       return true;
     }
@@ -322,6 +323,14 @@ impl BarLayer {
       .expect("attach wayland buffer");
     self.layer.commit();
   }
+}
+
+fn menu_layer(open: bool) -> Layer {
+  if open { Layer::Overlay } else { Layer::Top }
+}
+
+fn exclusive_zone(menu_open: bool) -> i32 {
+  if menu_open { 0 } else { BAR.height as i32 }
 }
 
 fn copy_pixels(canvas: &mut [u8], pixels: &[u8]) {
@@ -471,5 +480,20 @@ mod tests {
     current.open_path = vec![0];
     let merged = super::merge_menu(Some(current), Some(menu(":1.1/StatusNotifierItem"))).unwrap();
     assert_eq!(merged.open_path, vec![0]);
+  }
+
+  #[test]
+  fn menu_uses_overlay_layer() {
+    assert_eq!(super::menu_layer(true), super::Layer::Overlay);
+    assert_eq!(super::menu_layer(false), super::Layer::Top);
+  }
+
+  #[test]
+  fn menu_has_no_exclusive_zone() {
+    assert_eq!(super::exclusive_zone(true), 0);
+    assert_eq!(
+      super::exclusive_zone(false),
+      crate::config::BAR.height as i32
+    );
   }
 }
