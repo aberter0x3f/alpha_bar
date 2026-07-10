@@ -13,16 +13,24 @@ pub fn segment(text: String) -> Segment {
 
 pub fn spawn(tx: Sender<Update>) {
   thread::spawn(move || {
+    let mut last = String::new();
     loop {
-      let _ = tx.send(Update::Clock(segment(current())));
-      thread::sleep(Duration::from_secs(1));
+      let now = chrono::Local::now();
+      let text = clock_text(now.hour() as u8, now.minute() as u8);
+      if text != last {
+        last = text.clone();
+        let _ = tx.send(Update::Clock(segment(text)));
+      }
+      thread::sleep(delay_to_next_minute(now.second(), now.nanosecond()));
     }
   });
 }
 
-fn current() -> String {
-  let now = chrono::Local::now();
-  clock_text(now.hour() as u8, now.minute() as u8)
+fn delay_to_next_minute(second: u32, nanosecond: u32) -> Duration {
+  let remaining = 60_000_000_000u64
+    .saturating_sub(second as u64 * 1_000_000_000 + nanosecond as u64)
+    .max(1_000_000);
+  Duration::from_nanos(remaining)
 }
 
 #[cfg(test)]
@@ -32,5 +40,11 @@ mod tests {
   #[test]
   fn clock() {
     assert_eq!(clock_text(9, 5), "󰥔 09:05");
+  }
+
+  #[test]
+  fn next_minute_delay() {
+    assert_eq!(delay_to_next_minute(12, 0).as_secs(), 48);
+    assert_eq!(delay_to_next_minute(59, 0).as_secs(), 1);
   }
 }

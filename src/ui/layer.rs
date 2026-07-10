@@ -36,14 +36,14 @@ use crate::{
   app::build_segments,
   config::BAR,
   runtime::{RuntimeCommand, Update},
-  state::{Click, Segment, Snapshot, TrayMenuHit, TrayMenuPopup},
+  state::{Click, Snapshot, TrayMenuHit, TrayMenuPopup},
   ui::input::click_target_with_origin,
   ui::layout::menu_hit,
   ui::render::{render_menu_scaled, render_ui_scaled},
 };
 
 pub fn run(
-  mut snapshot: Snapshot,
+  snapshot: Snapshot,
   rx: Receiver<Update>,
   cmd_tx: Sender<RuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +63,7 @@ pub fn run(
   layer.set_exclusive_zone(BAR.height as i32);
   layer.commit();
 
+  let menu = snapshot.tray_menu.clone();
   let mut bar = BarLayer {
     registry: RegistryState::new(&globals),
     seat: SeatState::new(&globals, &qh),
@@ -79,8 +80,8 @@ pub fn run(
     height: BAR.height,
     menu_open: false,
     scale: 1,
-    segments: build_segments(&snapshot),
-    menu: snapshot.tray_menu.clone(),
+    snapshot,
+    menu,
     closed: false,
     dirty: false,
     cmd_tx,
@@ -95,8 +96,8 @@ pub fn run(
   queue.flush()?;
   while !bar.closed {
     queue.dispatch_pending(&mut bar)?;
-    let dirty = drain_updates(&mut snapshot, &rx);
-    if bar.redraw_dirty(&qh, &snapshot, dirty) {
+    let dirty = drain_updates(&mut bar.snapshot, &rx);
+    if bar.redraw_dirty(&qh, dirty) {
       queue.flush()?;
     } else if bar.menu_layer.as_ref().is_some_and(|layer| layer.dirty) {
       bar.draw_menu();
@@ -170,7 +171,7 @@ struct BarLayer {
   height: u32,
   menu_open: bool,
   scale: u32,
-  segments: Vec<Segment>,
+  snapshot: Snapshot,
   menu: Option<TrayMenuPopup>,
   closed: bool,
   dirty: bool,
@@ -258,13 +259,12 @@ impl PointerHandler for BarLayer {
 }
 
 impl BarLayer {
-  fn redraw_dirty(&mut self, qh: &QueueHandle<Self>, snapshot: &Snapshot, dirty: bool) -> bool {
+  fn redraw_dirty(&mut self, qh: &QueueHandle<Self>, dirty: bool) -> bool {
     if !(dirty || self.dirty) {
       return false;
     }
-    self.segments = build_segments(snapshot);
-    self.menu = merge_menu(self.menu.take(), snapshot.tray_menu.clone());
-    let created_menu_layer = self.sync_menu_layer(qh, snapshot.tray_menu.is_some());
+    self.menu = merge_menu(self.menu.take(), self.snapshot.tray_menu.clone());
+    let created_menu_layer = self.sync_menu_layer(qh, self.snapshot.tray_menu.is_some());
     if !created_menu_layer && let Some(menu_layer) = &mut self.menu_layer {
       menu_layer.dirty = true;
     }
@@ -315,7 +315,7 @@ impl BarLayer {
       BAR.height as usize,
       x,
       y,
-      &self.segments,
+      &build_segments(&self.snapshot),
     ) {
       Some((Click::Tray(address), menu_x)) => {
         let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
@@ -364,7 +364,7 @@ impl BarLayer {
       self.width as usize,
       self.height as usize,
       self.scale,
-      &self.segments,
+      &build_segments(&self.snapshot),
       None,
     );
     paint_surface(

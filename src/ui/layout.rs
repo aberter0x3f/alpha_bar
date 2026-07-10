@@ -19,7 +19,7 @@ pub(crate) struct SegmentRect<'a> {
 
 pub(crate) fn layout_segments<'a>(
   width: usize,
-  segments: &'a [Segment],
+  segments: &'a [&'a Segment],
   text_width: impl Fn(&str) -> f64,
 ) -> Vec<SegmentRect<'a>> {
   let widths = segments

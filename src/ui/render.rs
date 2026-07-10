@@ -3,13 +3,14 @@ use crate::{
   state::{Segment, Side, TrayMenuPopup},
   style::{argb, underline},
   ui::layout::{MENU_ROW_HEIGHT, RIGHT_GAP, layout_segments, menu_column_width, menu_columns},
+  ui::text::{font_description, text_width},
 };
 
 pub(crate) fn render_ui_scaled(
   width: usize,
   height: usize,
   scale: u32,
-  segments: &[Segment],
+  segments: &[&Segment],
   menu: Option<&TrayMenuPopup>,
 ) -> Vec<u8> {
   let scale = scale.max(1) as usize;
@@ -29,7 +30,7 @@ pub(crate) fn render_ui_scaled(
     height.min(BAR.height as usize) as f64,
   );
   cr.fill().expect("paint background");
-  let font = font_description();
+  let font = font_description(STYLE.font);
 
   for rect in layout_segments(width, segments, |text| text_width(&cr, &font, text)) {
     draw_segment(&cr, &font, rect.segment, rect.x, rect.width);
@@ -63,7 +64,7 @@ pub(crate) fn render_menu_scaled(
   cr.rectangle(0.0, 0.0, width as f64, height as f64);
   cr.fill().expect("clear menu surface");
   cr.set_operator(cairo::Operator::Over);
-  let font = font_description();
+  let font = font_description(STYLE.font);
   draw_menu(&cr, &font, menu);
   drop(cr);
   surface.flush();
@@ -113,13 +114,6 @@ fn draw_menu(cr: &cairo::Context, font: &pango::FontDescription, menu: &TrayMenu
   }
 }
 
-fn text_width(cr: &cairo::Context, font: &pango::FontDescription, text: &str) -> f64 {
-  let layout = pangocairo::functions::create_layout(cr);
-  layout.set_text(text);
-  layout.set_font_description(Some(font));
-  (layout.pixel_extents().1.width() as f64).max(4.0)
-}
-
 fn draw_segment(
   cr: &cairo::Context,
   font: &pango::FontDescription,
@@ -146,10 +140,11 @@ fn draw_icon(cr: &cairo::Context, x: f64, y: f64, icon: &crate::state::Icon) {
   if icon.height == 0 {
     return;
   }
-  // The surface is used only for the immediate paint below and never escapes this function.
+  let mut pixels = icon_surface_pixels(icon);
+  // Cairo requires mutable image data; paint from a local copy so borrowed snapshot icons remain immutable.
   let Ok(surface) = (unsafe {
     cairo::ImageSurface::create_for_data_unsafe(
-      icon.pixels.as_ptr().cast_mut(),
+      pixels.as_mut_ptr(),
       cairo::Format::ARgb32,
       icon.width as i32,
       icon.height as i32,
@@ -169,6 +164,10 @@ fn draw_icon(cr: &cairo::Context, x: f64, y: f64, icon: &crate::state::Icon) {
   cr.restore().expect("restore icon context");
 }
 
+fn icon_surface_pixels(icon: &crate::state::Icon) -> Vec<u8> {
+  icon.pixels.clone()
+}
+
 fn draw_text_centered(
   cr: &cairo::Context,
   font: &pango::FontDescription,
@@ -186,15 +185,29 @@ fn draw_text_centered(
   pangocairo::functions::show_layout(cr, &layout);
 }
 
-fn font_description() -> pango::FontDescription {
-  let mut font = pango::FontDescription::from_string(STYLE.font);
-  font.set_absolute_size(16.0 * pango::SCALE as f64);
-  font
-}
-
 fn set_color(cr: &cairo::Context, argb: u32) {
   let r = ((argb >> 16) & 0xff) as f64 / 255.0;
   let g = ((argb >> 8) & 0xff) as f64 / 255.0;
   let b = (argb & 0xff) as f64 / 255.0;
   cr.set_source_rgb(r, g, b);
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::state::Icon;
+
+  use super::*;
+
+  #[test]
+  fn icon_pixels_copied() {
+    let icon = Icon {
+      width: 1,
+      height: 1,
+      pixels: vec![1, 2, 3, 4],
+    };
+
+    let pixels = icon_surface_pixels(&icon);
+    assert_eq!(pixels, icon.pixels);
+    assert_ne!(pixels.as_ptr(), icon.pixels.as_ptr());
+  }
 }

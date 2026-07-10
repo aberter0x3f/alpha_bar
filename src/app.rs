@@ -1,24 +1,21 @@
 use crate::state::{Segment, Snapshot};
 
-pub fn build_segments(snapshot: &Snapshot) -> Vec<Segment> {
-  let mut segments = snapshot.workspaces.clone();
+pub fn build_segments(snapshot: &Snapshot) -> Vec<&Segment> {
+  let mut segments = Vec::with_capacity(snapshot.workspaces.len() + snapshot.tray.len() + 7);
+  segments.extend(snapshot.workspaces.iter());
   if !snapshot.tray.is_empty() {
-    segments.extend(snapshot.tray.clone());
+    segments.extend(snapshot.tray.iter());
   }
-  let right = [
-    snapshot.network.clone(),
-    snapshot.net_speed.clone(),
-    snapshot.audio.clone(),
-    snapshot.cpu.clone(),
-    snapshot.memory.clone(),
-    snapshot.temperature.clone(),
-  ];
+  segments.push(&snapshot.network);
+  segments.push(&snapshot.net_speed);
+  segments.push(&snapshot.audio);
+  segments.push(&snapshot.cpu);
+  segments.push(&snapshot.memory);
+  segments.push(&snapshot.temperature);
   if let Some(battery) = &snapshot.battery {
-    segments.extend(right.into_iter().chain([battery.clone()]));
-  } else {
-    segments.extend(right);
+    segments.push(battery);
   }
-  segments.push(snapshot.clock.clone());
+  segments.push(&snapshot.clock);
   segments
 }
 
@@ -29,7 +26,7 @@ mod tests {
 
   #[test]
   fn segments() {
-    let segments = build_segments(&Snapshot {
+    let snapshot = Snapshot {
       workspaces: vec![
         Segment::new(Side::Left, Class::Normal, "1"),
         Segment::new(Side::Left, Class::Active, "2"),
@@ -52,7 +49,8 @@ mod tests {
       temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
       battery: Some(Segment::new(Side::Right, Class::Plugged, " 100%")),
       clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
-    });
+    };
+    let segments = build_segments(&snapshot);
 
     assert_eq!(segments[0].side, Side::Left);
     assert_eq!(segments[0].text, "1");
@@ -68,7 +66,7 @@ mod tests {
 
   #[test]
   fn empty_tray() {
-    let segments = build_segments(&Snapshot {
+    let snapshot = Snapshot {
       workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
       tray: Vec::new(),
       tray_menu: None,
@@ -80,10 +78,20 @@ mod tests {
       temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
       battery: None,
       clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
-    });
+    };
+    let segments = build_segments(&snapshot);
 
     assert_eq!(segments[0].text, "1");
     assert_eq!(segments[1].text, "󰲛 Disconnected");
     assert!(!segments.iter().any(|segment| segment.text == "󰂑 N/A"));
+  }
+
+  #[test]
+  fn segments_borrow_snapshot() {
+    let snapshot = Snapshot::default();
+    let segments = build_segments(&snapshot);
+
+    assert!(std::ptr::eq(segments[0], &snapshot.workspaces[0]));
+    assert!(std::ptr::eq(segments[1], &snapshot.network));
   }
 }

@@ -1,5 +1,10 @@
 use std::{
-  cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc::Sender, thread, time::Duration,
+  cell::RefCell,
+  collections::HashMap,
+  rc::{Rc, Weak},
+  sync::mpsc::Sender,
+  thread,
+  time::Duration,
 };
 
 use pipewire::{
@@ -76,20 +81,88 @@ pub fn segment(text: String) -> Segment {
 
 pub fn spawn(tx: Sender<Update>) {
   thread::spawn(move || {
+    let mut retry_delay = Duration::from_secs(1);
     loop {
       if let Err(err) = run(tx.clone()) {
         eprintln!("alpha_bar: PipeWire audio monitor failed: {err}");
       }
-      thread::sleep(Duration::from_secs(1));
+      thread::sleep(retry_delay);
+      retry_delay = next_retry_delay(retry_delay);
     }
   });
+}
+
+fn next_retry_delay(delay: Duration) -> Duration {
+  (delay * 2).min(Duration::from_secs(30))
+}
+
+struct AudioState {
+  tx: Sender<Update>,
+  default_sink: Option<String>,
+  node_id_by_name: HashMap<String, u32>,
+  node_name_by_id: HashMap<u32, String>,
+  nodes: HashMap<u32, pw::node::Node>,
+  metadata: HashMap<u32, pw::metadata::Metadata>,
+  listeners: HashMap<u32, Vec<Box<dyn pw::proxy::Listener>>>,
+  registry_listener: Option<pw::registry::Listener>,
+}
+
+impl AudioState {
+  fn new(tx: Sender<Update>) -> Self {
+    Self {
+      tx,
+      default_sink: None,
+      node_id_by_name: HashMap::new(),
+      node_name_by_id: HashMap::new(),
+      nodes: HashMap::new(),
+      metadata: HashMap::new(),
+      listeners: HashMap::new(),
+      registry_listener: None,
+    }
+  }
+
+  fn remove(&mut self, id: u32) {
+    let removed_default = self
+      .node_name_by_id
+      .get(&id)
+      .is_some_and(|name| self.default_sink.as_deref() == Some(name.as_str()));
+    if let Some(name) = self.node_name_by_id.remove(&id) {
+      self.node_id_by_name.remove(&name);
+    }
+    self.nodes.remove(&id);
+    self.metadata.remove(&id);
+    self.listeners.remove(&id);
+    if removed_default {
+      self.clear_audio();
+    }
+  }
+
+  fn clear_audio(&self) {
+    let _ = self.tx.send(Update::Audio(segment(text(0, true))));
+  }
+
+  fn refresh_default(&self) {
+    let Some(name) = self.default_sink.as_deref() else {
+      return;
+    };
+    let Some(id) = self.node_id_by_name.get(name) else {
+      return;
+    };
+    if let Some(node) = self.nodes.get(id) {
+      node.enum_params(0, Some(pw::spa::param::ParamType::Props), 0, u32::MAX);
+    }
+  }
+}
+
+fn listener_state(state: &Rc<RefCell<AudioState>>) -> Weak<RefCell<AudioState>> {
+  Rc::downgrade(state)
 }
 
 fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
   use pw::{
     metadata::Metadata,
     node::Node,
-    proxy::{Listener, ProxyT},
+    proxy::ProxyT,
     registry::GlobalObject,
     spa::{self, param::ParamType},
     types::ObjectType,
@@ -101,64 +174,6 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
   let core = context.connect_rc(None)?;
   let registry = core.get_registry_rc()?;
   let registry_weak = registry.downgrade();
-
-  struct AudioState {
-    tx: Sender<Update>,
-    default_sink: Option<String>,
-    node_id_by_name: HashMap<String, u32>,
-    node_name_by_id: HashMap<u32, String>,
-    nodes: HashMap<u32, Node>,
-    metadata: HashMap<u32, Metadata>,
-    listeners: HashMap<u32, Vec<Box<dyn Listener>>>,
-    registry_listener: Option<pw::registry::Listener>,
-  }
-
-  impl AudioState {
-    fn new(tx: Sender<Update>) -> Self {
-      Self {
-        tx,
-        default_sink: None,
-        node_id_by_name: HashMap::new(),
-        node_name_by_id: HashMap::new(),
-        nodes: HashMap::new(),
-        metadata: HashMap::new(),
-        listeners: HashMap::new(),
-        registry_listener: None,
-      }
-    }
-
-    fn remove(&mut self, id: u32) {
-      let removed_default = self
-        .node_name_by_id
-        .get(&id)
-        .is_some_and(|name| self.default_sink.as_deref() == Some(name.as_str()));
-      if let Some(name) = self.node_name_by_id.remove(&id) {
-        self.node_id_by_name.remove(&name);
-      }
-      self.nodes.remove(&id);
-      self.metadata.remove(&id);
-      self.listeners.remove(&id);
-      if removed_default {
-        self.clear_audio();
-      }
-    }
-
-    fn clear_audio(&self) {
-      let _ = self.tx.send(Update::Audio(segment(text(0, true))));
-    }
-
-    fn refresh_default(&self) {
-      let Some(name) = self.default_sink.as_deref() else {
-        return;
-      };
-      let Some(id) = self.node_id_by_name.get(name) else {
-        return;
-      };
-      if let Some(node) = self.nodes.get(id) {
-        node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
-      }
-    }
-  }
 
   fn bind_node(
     registry: &pw::registry::Registry,
@@ -186,8 +201,11 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
     let listener = node
       .add_listener_local()
       .param({
-        let state = Rc::clone(&state);
+        let state = listener_state(&state);
         move |_seq, id, _index, _next, param| {
+          let Some(state) = state.upgrade() else {
+            return;
+          };
           if id != ParamType::Props {
             return;
           }
@@ -219,8 +237,12 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
       .upcast_ref()
       .add_listener_local()
       .removed({
-        let state = Rc::clone(&state);
-        move || state.borrow_mut().remove(node_id)
+        let state = listener_state(&state);
+        move || {
+          if let Some(state) = state.upgrade() {
+            state.borrow_mut().remove(node_id);
+          }
+        }
       })
       .register();
     let mut state = state.borrow_mut();
@@ -256,8 +278,11 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
     let listener = metadata
       .add_listener_local()
       .property({
-        let state = Rc::clone(&state);
+        let state = listener_state(&state);
         move |_subject, key, _type, value| {
+          let Some(state) = state.upgrade() else {
+            return 0;
+          };
           if key != Some("default.audio.sink") {
             return 0;
           }
@@ -275,8 +300,12 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
       .upcast_ref()
       .add_listener_local()
       .removed({
-        let state = Rc::clone(&state);
-        move || state.borrow_mut().remove(metadata_id)
+        let state = listener_state(&state);
+        move || {
+          if let Some(state) = state.upgrade() {
+            state.borrow_mut().remove(metadata_id);
+          }
+        }
       })
       .register();
     let mut state = state.borrow_mut();
@@ -297,8 +326,11 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
   let registry_listener = registry
     .add_listener_local()
     .global({
-      let state = Rc::clone(&state);
+      let state = listener_state(&state);
       move |global| {
+        let Some(state) = state.upgrade() else {
+          return;
+        };
         let Some(registry) = registry_weak.upgrade() else {
           return;
         };
@@ -310,8 +342,12 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
       }
     })
     .global_remove({
-      let state = Rc::clone(&state);
-      move |id| state.borrow_mut().remove(id)
+      let state = listener_state(&state);
+      move |id| {
+        if let Some(state) = state.upgrade() {
+          state.borrow_mut().remove(id);
+        }
+      }
     })
     .register();
   state.borrow_mut().registry_listener = Some(registry_listener);
@@ -339,5 +375,28 @@ mod tests {
     assert_eq!(volume_percent(&[0.216, 0.216]), 60);
     assert_eq!(volume_percent(&[0.512, 0.512]), 80);
     assert_eq!(volume_percent(&[2.0]), 100);
+  }
+
+  #[test]
+  fn retry_backoff() {
+    let mut delay = Duration::from_secs(1);
+    delay = next_retry_delay(delay);
+    assert_eq!(delay, Duration::from_secs(2));
+    delay = next_retry_delay(delay);
+    assert_eq!(delay, Duration::from_secs(4));
+    for _ in 0..8 {
+      delay = next_retry_delay(delay);
+    }
+    assert_eq!(delay, Duration::from_secs(30));
+  }
+
+  #[test]
+  fn listener_state_weak() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let state = Rc::new(RefCell::new(AudioState::new(tx)));
+    let weak = listener_state(&state);
+
+    assert_eq!(Rc::strong_count(&state), 1);
+    assert_eq!(weak.strong_count(), 1);
   }
 }
