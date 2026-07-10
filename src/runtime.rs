@@ -1,7 +1,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-  modules::{audio, clock, cpu, memory, net_speed, network, niri, power, temperature, tray},
+  modules::{audio, clock, cpu, memory, network, niri, power, temperature, tray},
   state::{Class, Segment, Side, Snapshot, TrayMenuPopup},
 };
 
@@ -43,7 +43,7 @@ impl Default for Snapshot {
       tray: Vec::new(),
       tray_menu: None,
       network: network::segment("󰲛 Disconnected".into()),
-      net_speed: net_speed::default_segment(),
+      net_speed: network::default_speed_segment(),
       audio: audio::segment("󰖁 0%".into()),
       cpu: cpu::segment(0),
       memory: memory::segment(0),
@@ -79,7 +79,6 @@ pub fn spawn_workers(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
   temperature::spawn(tx.clone());
   power::spawn(tx.clone());
   clock::spawn(tx.clone());
-  net_speed::spawn(tx.clone());
   niri::spawn(tx.clone());
   tray::spawn(tx.clone(), cmd_rx);
   cpu::spawn(tx);

@@ -2,7 +2,7 @@ use std::{
   cell::RefCell,
   collections::HashMap,
   rc::{Rc, Weak},
-  sync::mpsc::Sender,
+  sync::{Once, mpsc::Sender},
   thread,
   time::Duration,
 };
@@ -96,6 +96,11 @@ fn next_retry_delay(delay: Duration) -> Duration {
   (delay * 2).min(Duration::from_secs(30))
 }
 
+fn init_pipewire() {
+  static INIT: Once = Once::new();
+  INIT.call_once(pw::init);
+}
+
 struct AudioState {
   tx: Sender<Update>,
   default_sink: Option<String>,
@@ -168,7 +173,7 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
     types::ObjectType,
   };
 
-  pw::init();
+  init_pipewire();
   let main_loop = pw::main_loop::MainLoopRc::new(None)?;
   let context = pw::context::ContextRc::new(&main_loop, None)?;
   let core = context.connect_rc(None)?;
@@ -353,7 +358,6 @@ fn run(tx: Sender<Update>) -> Result<(), pw::Error> {
   state.borrow_mut().registry_listener = Some(registry_listener);
 
   main_loop.run();
-  unsafe { pw::deinit() };
   Ok(())
 }
 

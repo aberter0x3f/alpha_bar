@@ -239,8 +239,11 @@ mod tests {
   use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixListener,
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
   };
+
+  static SOCKET_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
   #[test]
   fn workspace_events() {
@@ -312,7 +315,9 @@ mod tests {
 
   #[test]
   fn event_stream_socket() {
-    let path = std::env::temp_dir().join(format!("alpha-bar-niri-{}.sock", std::process::id()));
+    let id = SOCKET_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let path =
+      std::env::temp_dir().join(format!("alpha-bar-niri-{}-{id}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
     let server = thread::spawn(move || {

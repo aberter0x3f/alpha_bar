@@ -2,7 +2,6 @@ pub(crate) mod audio;
 pub(crate) mod clock;
 pub(crate) mod cpu;
 pub(crate) mod memory;
-pub(crate) mod net_speed;
 pub(crate) mod network;
 pub(crate) mod niri;
 pub(crate) mod power;
