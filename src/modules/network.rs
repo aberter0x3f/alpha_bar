@@ -11,12 +11,10 @@ pub fn dev_bytes(input: &str, iface: &str) -> Option<(u64, u64)> {
     .lines()
     .find(|line| line.trim_start().starts_with(&prefix))?;
   let data = line.split_once(':')?.1;
-  let nums = data
-    .split_whitespace()
-    .map(str::parse::<u64>)
-    .collect::<Result<Vec<_>, _>>()
-    .ok()?;
-  Some((*nums.first()?, *nums.get(8)?))
+  let mut cols = data.split_whitespace();
+  let rx = cols.next()?.parse::<u64>().ok()?;
+  let tx = cols.nth(7)?.parse::<u64>().ok()?;
+  Some((rx, tx))
 }
 
 pub fn segment(text: String) -> Segment {

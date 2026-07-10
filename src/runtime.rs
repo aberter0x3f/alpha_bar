@@ -15,7 +15,7 @@ pub enum Update {
   Cpu(Segment),
   Memory(Segment),
   Temperature(Segment),
-  Battery(Segment),
+  Battery(Option<Segment>),
   Clock(Segment),
 }
 
@@ -25,6 +25,7 @@ pub enum RuntimeCommand {
     context_menu: bool,
     x: i32,
     y: i32,
+    menu_x: i32,
   },
   TrayMenuItem {
     address: String,
@@ -32,6 +33,7 @@ pub enum RuntimeCommand {
     id: i32,
   },
   TrayMenuClose,
+  TrayScale(u32),
 }
 
 pub struct RuntimeState {
@@ -51,7 +53,7 @@ impl Default for RuntimeState {
         cpu: cpu::segment(0),
         memory: memory::segment(0),
         temperature: temperature::segment(0),
-        battery: power::default_segment(),
+        battery: None,
         clock: clock::segment(clock::clock_text(0, 0)),
       },
     }

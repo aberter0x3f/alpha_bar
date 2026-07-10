@@ -14,6 +14,7 @@ use smithay_client_toolkit::{
   registry_handlers,
   seat::{
     Capability, SeatHandler, SeatState,
+    keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
     pointer::{BTN_LEFT, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler},
   },
   shell::{
@@ -28,7 +29,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
   Connection, QueueHandle,
   globals::registry_queue_init,
-  protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+  protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 use crate::{
@@ -36,8 +37,8 @@ use crate::{
   config::BAR,
   runtime::{RuntimeCommand, RuntimeState, Update},
   state::{Click, Segment, TrayMenuHit, TrayMenuPopup},
-  ui::input::click_target,
-  ui::render::render_ui_scaled,
+  ui::input::click_target_with_origin,
+  ui::render::{render_menu_scaled, render_ui_scaled},
 };
 
 pub fn run(
@@ -67,8 +68,12 @@ pub fn run(
     output: OutputState::new(&globals, &qh),
     shm,
     pool,
+    compositor,
+    layer_shell,
     layer,
+    menu_layer: None,
     pointer: None,
+    keyboard: None,
     width: 1,
     height: BAR.height,
     menu_open: false,
@@ -79,6 +84,7 @@ pub fn run(
     dirty: false,
     cmd_tx,
   };
+  let _ = bar.cmd_tx.send(RuntimeCommand::TrayScale(bar.scale));
 
   queue.blocking_dispatch(&mut bar)?;
   if bar.dirty {
@@ -96,12 +102,16 @@ pub fn run(
     if dirty || bar.dirty {
       bar.segments = segments_from_state(&state);
       bar.menu = merge_menu(bar.menu.take(), state.snapshot().tray_menu.clone());
-      if bar.set_menu_open(state.snapshot().tray_menu.is_some()) {
-        queue.flush()?;
-      } else {
-        bar.draw();
-        queue.flush()?;
+      let created_menu_layer = bar.sync_menu_layer(&qh, state.snapshot().tray_menu.is_some());
+      if !created_menu_layer && let Some(menu_layer) = &mut bar.menu_layer {
+        menu_layer.dirty = true;
       }
+      bar.draw();
+      bar.draw_menu();
+      queue.flush()?;
+    } else if bar.menu_layer.as_ref().is_some_and(|layer| layer.dirty) {
+      bar.draw_menu();
+      queue.flush()?;
     }
     queue.flush()?;
     if let Some(read) = queue.prepare_read() {
@@ -156,8 +166,12 @@ struct BarLayer {
   output: OutputState,
   shm: Shm,
   pool: SlotPool,
+  compositor: CompositorState,
+  layer_shell: LayerShell,
   layer: LayerSurface,
+  menu_layer: Option<MenuLayer>,
   pointer: Option<wl_pointer::WlPointer>,
+  keyboard: Option<wl_keyboard::WlKeyboard>,
   width: u32,
   height: u32,
   menu_open: bool,
@@ -167,6 +181,13 @@ struct BarLayer {
   closed: bool,
   dirty: bool,
   cmd_tx: Sender<RuntimeCommand>,
+}
+
+struct MenuLayer {
+  layer: LayerSurface,
+  width: u32,
+  height: u32,
+  dirty: bool,
 }
 
 impl SeatHandler for BarLayer {
@@ -185,6 +206,8 @@ impl SeatHandler for BarLayer {
   ) {
     if capability == Capability::Pointer && self.pointer.is_none() {
       self.pointer = self.seat.get_pointer(qh, &seat).ok();
+    } else if capability == Capability::Keyboard && self.keyboard.is_none() {
+      self.keyboard = self.seat.get_keyboard(qh, &seat, None).ok();
     }
   }
 
@@ -199,6 +222,10 @@ impl SeatHandler for BarLayer {
       && let Some(pointer) = self.pointer.take()
     {
       pointer.release();
+    } else if capability == Capability::Keyboard
+      && let Some(keyboard) = self.keyboard.take()
+    {
+      keyboard.release();
     }
   }
 
@@ -214,6 +241,17 @@ impl PointerHandler for BarLayer {
     events: &[PointerEvent],
   ) {
     for event in events {
+      if self
+        .menu_layer
+        .as_ref()
+        .is_some_and(|menu_layer| &event.surface == menu_layer.layer.wl_surface())
+      {
+        let PointerEventKind::Press { .. } = event.kind else {
+          continue;
+        };
+        self.handle_menu_press(event.position.0, event.position.1);
+        continue;
+      }
       if &event.surface != self.layer.wl_surface() {
         continue;
       }
@@ -225,28 +263,7 @@ impl PointerHandler for BarLayer {
         BTN_RIGHT => true,
         _ => continue,
       };
-      if let Some(menu) = self.menu.as_mut() {
-        match menu.hit(event.position.0, event.position.1) {
-          TrayMenuHit::Activate { id } => {
-            let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
-              address: menu.address.clone(),
-              path: menu.path.clone(),
-              id,
-            });
-            continue;
-          }
-          TrayMenuHit::OpenSubmenu { path } => {
-            menu.open_path = path;
-            self.draw();
-            continue;
-          }
-          TrayMenuHit::Outside => {
-            let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
-            continue;
-          }
-        }
-      }
-      match click_target(
+      match click_target_with_origin(
         self.width as usize,
         BAR.height as usize,
         event.position.0,
@@ -254,13 +271,17 @@ impl PointerHandler for BarLayer {
         &self.segments,
         self.menu.as_ref(),
       ) {
-        Some(Click::Tray(address)) => {
+        Some((Click::Tray(address), menu_x)) => {
           let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
             address,
             context_menu,
             x: event.position.0.round() as i32,
             y: event.position.1.round() as i32,
+            menu_x: menu_x.round() as i32,
           });
+        }
+        None if self.menu_open => {
+          let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
         }
         None => {}
       }
@@ -269,26 +290,60 @@ impl PointerHandler for BarLayer {
 }
 
 impl BarLayer {
-  fn set_menu_open(&mut self, open: bool) -> bool {
-    if self.menu_open != open {
-      self.menu_open = open;
-      self.layer.set_layer(menu_layer(open));
-      if open {
-        self
-          .layer
-          .set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        self.layer.set_size(0, 0);
-      } else {
-        self
-          .layer
-          .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        self.layer.set_size(0, BAR.height);
-      }
-      self.layer.set_exclusive_zone(exclusive_zone(open));
-      self.layer.commit();
-      return true;
+  fn sync_menu_layer(&mut self, qh: &QueueHandle<Self>, open: bool) -> bool {
+    self.menu_open = open;
+    if !open {
+      self.menu_layer = None;
+      return false;
     }
-    false
+    if self.menu_layer.is_some() {
+      return false;
+    }
+    let surface = self.compositor.create_surface(qh);
+    let layer = self.layer_shell.create_layer_surface(
+      qh,
+      surface,
+      Layer::Overlay,
+      Some("alpha_bar_menu"),
+      None,
+    );
+    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    layer.set_size(0, 0);
+    layer.set_exclusive_zone(0);
+    layer.commit();
+    self.menu_layer = Some(MenuLayer {
+      layer,
+      width: 1,
+      height: 1,
+      dirty: false,
+    });
+    true
+  }
+
+  fn handle_menu_press(&mut self, x: f64, y: f64) {
+    let Some(menu) = self.menu.as_mut() else {
+      let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
+      return;
+    };
+    match menu.hit(x, y) {
+      TrayMenuHit::Activate { id } => {
+        let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
+          address: menu.address.clone(),
+          path: menu.path.clone(),
+          id,
+        });
+      }
+      TrayMenuHit::OpenSubmenu { path } => {
+        menu.open_path = path;
+        if let Some(menu_layer) = &mut self.menu_layer {
+          menu_layer.dirty = true;
+        }
+      }
+      TrayMenuHit::Outside => {
+        let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
+      }
+    }
   }
 
   fn draw(&mut self) {
@@ -310,7 +365,7 @@ impl BarLayer {
       self.height as usize,
       self.scale,
       &self.segments,
-      self.menu.as_ref(),
+      None,
     );
     copy_pixels(canvas, &pixels);
     self.layer.wl_surface().set_buffer_scale(self.scale as i32);
@@ -323,14 +378,47 @@ impl BarLayer {
       .expect("attach wayland buffer");
     self.layer.commit();
   }
-}
 
-fn menu_layer(open: bool) -> Layer {
-  if open { Layer::Overlay } else { Layer::Top }
-}
-
-fn exclusive_zone(menu_open: bool) -> i32 {
-  if menu_open { 0 } else { BAR.height as i32 }
+  fn draw_menu(&mut self) {
+    let (Some(menu), Some(menu_layer)) = (&self.menu, &mut self.menu_layer) else {
+      return;
+    };
+    if !menu_layer.dirty {
+      return;
+    }
+    menu_layer.dirty = false;
+    let buffer_width = menu_layer.width * self.scale;
+    let buffer_height = menu_layer.height * self.scale;
+    let stride = buffer_width as i32 * 4;
+    let (buffer, canvas) = self
+      .pool
+      .create_buffer(
+        buffer_width as i32,
+        buffer_height as i32,
+        stride,
+        wl_shm::Format::Argb8888,
+      )
+      .expect("create wayland buffer");
+    let pixels = render_menu_scaled(
+      menu_layer.width as usize,
+      menu_layer.height as usize,
+      self.scale,
+      menu,
+    );
+    copy_pixels(canvas, &pixels);
+    menu_layer
+      .layer
+      .wl_surface()
+      .set_buffer_scale(self.scale as i32);
+    menu_layer
+      .layer
+      .wl_surface()
+      .damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
+    buffer
+      .attach_to(menu_layer.layer.wl_surface())
+      .expect("attach wayland buffer");
+    menu_layer.layer.commit();
+  }
 }
 
 fn copy_pixels(canvas: &mut [u8], pixels: &[u8]) {
@@ -350,6 +438,10 @@ impl CompositorHandler for BarLayer {
     let scale = u32::try_from(scale).unwrap_or(1).max(1);
     if self.scale != scale {
       self.scale = scale;
+      let _ = self.cmd_tx.send(RuntimeCommand::TrayScale(scale));
+      if let Some(menu_layer) = &mut self.menu_layer {
+        menu_layer.dirty = true;
+      }
       self.dirty = true;
     }
   }
@@ -405,13 +497,22 @@ impl LayerShellHandler for BarLayer {
     &mut self,
     _: &Connection,
     _: &QueueHandle<Self>,
-    _: &LayerSurface,
+    layer: &LayerSurface,
     configure: LayerSurfaceConfigure,
     _: u32,
   ) {
-    self.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, NonZeroU32::get);
-    self.height = NonZeroU32::new(configure.new_size.1).map_or(BAR.height, NonZeroU32::get);
-    self.dirty = true;
+    if layer == &self.layer {
+      self.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, NonZeroU32::get);
+      self.height = NonZeroU32::new(configure.new_size.1).map_or(BAR.height, NonZeroU32::get);
+      self.dirty = true;
+    } else if let Some(menu_layer) = &mut self.menu_layer
+      && layer == &menu_layer.layer
+    {
+      menu_layer.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, NonZeroU32::get);
+      menu_layer.height =
+        NonZeroU32::new(configure.new_size.1).map_or(self.height, NonZeroU32::get);
+      menu_layer.dirty = true;
+    }
   }
 }
 
@@ -421,11 +522,81 @@ impl ShmHandler for BarLayer {
   }
 }
 
+impl KeyboardHandler for BarLayer {
+  fn enter(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: &wl_surface::WlSurface,
+    _: u32,
+    _: &[u32],
+    _: &[Keysym],
+  ) {
+  }
+
+  fn leave(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: &wl_surface::WlSurface,
+    _: u32,
+  ) {
+  }
+
+  fn press_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: u32,
+    event: KeyEvent,
+  ) {
+    if self.menu_open && event.keysym == Keysym::Escape {
+      let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
+    }
+  }
+
+  fn repeat_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: u32,
+    _: KeyEvent,
+  ) {
+  }
+
+  fn release_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: u32,
+    _: KeyEvent,
+  ) {
+  }
+
+  fn update_modifiers(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &wl_keyboard::WlKeyboard,
+    _: u32,
+    _: Modifiers,
+    _: RawModifiers,
+    _: u32,
+  ) {
+  }
+}
+
 smithay_client_toolkit::delegate_compositor!(BarLayer);
 smithay_client_toolkit::delegate_layer!(BarLayer);
 smithay_client_toolkit::delegate_output!(BarLayer);
 smithay_client_toolkit::delegate_registry!(BarLayer);
 smithay_client_toolkit::delegate_seat!(BarLayer);
+smithay_client_toolkit::delegate_keyboard!(BarLayer);
 smithay_client_toolkit::delegate_pointer!(BarLayer);
 smithay_client_toolkit::delegate_shm!(BarLayer);
 
@@ -480,20 +651,5 @@ mod tests {
     current.open_path = vec![0];
     let merged = super::merge_menu(Some(current), Some(menu(":1.1/StatusNotifierItem"))).unwrap();
     assert_eq!(merged.open_path, vec![0]);
-  }
-
-  #[test]
-  fn menu_uses_overlay_layer() {
-    assert_eq!(super::menu_layer(true), super::Layer::Overlay);
-    assert_eq!(super::menu_layer(false), super::Layer::Top);
-  }
-
-  #[test]
-  fn menu_has_no_exclusive_zone() {
-    assert_eq!(super::exclusive_zone(true), 0);
-    assert_eq!(
-      super::exclusive_zone(false),
-      crate::config::BAR.height as i32
-    );
   }
 }

@@ -1,6 +1,6 @@
 use alpha_bar::{
   state::{Class, Click, Segment, Side},
-  ui::input::click_at,
+  ui::input::{click_at, click_at_with_origin},
 };
 
 #[test]
@@ -14,6 +14,10 @@ fn tray_click_hit() {
     Some(Click::Tray("addr".into()))
   );
   assert_eq!(click_at(200, 10.0, &segments), None);
+  assert_eq!(
+    click_at_with_origin(200, 50.0, &segments),
+    Some((Click::Tray("addr".into()), 34.0))
+  );
 }
 
 #[test]

@@ -54,14 +54,8 @@ pub fn segment(text: String, class: &str) -> Segment {
   Segment::new(Side::Right, class_from_battery(class), text)
 }
 
-pub fn default_segment() -> Segment {
-  Segment::new(Side::Right, Class::Disconnected, "󰂑 N/A")
-}
-
-pub fn system_segment(root: &Path) -> Segment {
-  system_battery(root).map_or_else(default_segment, |battery| {
-    segment(battery.text, battery.class)
-  })
+pub fn system_segment(root: &Path) -> Option<Segment> {
+  system_battery(root).map(|battery| segment(battery.text, battery.class))
 }
 
 pub fn spawn(tx: Sender<Update>) {
@@ -147,6 +141,18 @@ mod tests {
 
     assert_eq!(bat.text, "󰁾 50%");
     assert_eq!(bat.class, "normal");
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn no_battery() {
+    let root = std::env::temp_dir().join(format!("alpha-bar-no-power-{}", std::process::id()));
+    let mains = root.join("AC");
+    fs::create_dir_all(&mains).unwrap();
+    fs::write(mains.join("type"), "Mains\n").unwrap();
+
+    assert_eq!(system_segment(&root), None);
 
     let _ = fs::remove_dir_all(root);
   }

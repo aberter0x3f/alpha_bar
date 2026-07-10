@@ -4,7 +4,7 @@ use std::{
   io::Cursor,
   path::{Path, PathBuf},
   sync::{
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
     mpsc::{self, Receiver, Sender},
   },
   thread,
@@ -14,7 +14,8 @@ use std::{
 use cairo::{Format, ImageSurface};
 use zbus::{
   MatchRule,
-  blocking::{Connection, MessageIterator, Proxy},
+  blocking::{Connection, MessageIterator, Proxy, connection},
+  message::Header,
   zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
 };
 
@@ -22,6 +23,8 @@ use crate::{
   runtime::{RuntimeCommand, Update},
   state::{Class, Click, Icon, Segment, Side, TrayMenuEntry, TrayMenuPopup},
 };
+
+const TRAY_ICON_LOGICAL_SIZE: u32 = 20;
 
 pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
   thread::spawn(move || {
@@ -37,17 +40,42 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
     watch_tray(pump_tx.clone());
     let mut tray_generation = 0u64;
     let mut menu_generation = 0u64;
-    schedule_segments(&pump_tx, tray_generation);
+    let mut icon_size = tray_icon_size(1);
+    let mut refresh_running = false;
+    let mut refresh_pending = false;
+    request_segments(
+      &pump_tx,
+      &mut tray_generation,
+      &mut refresh_running,
+      &mut refresh_pending,
+      icon_size,
+    );
     while let Ok(event) = pump_rx.recv() {
       match event {
         PumpEvent::Refresh => {
-          tray_generation += 1;
-          schedule_segments(&pump_tx, tray_generation);
+          request_segments(
+            &pump_tx,
+            &mut tray_generation,
+            &mut refresh_running,
+            &mut refresh_pending,
+            icon_size,
+          );
         }
-        PumpEvent::Job(TrayJob::Segments(generation, segments))
-          if generation == tray_generation =>
-        {
-          let _ = tx.send(Update::Tray(segments));
+        PumpEvent::Job(TrayJob::Segments(generation, segments)) => {
+          if generation == tray_generation {
+            let _ = tx.send(Update::Tray(segments));
+            refresh_running = false;
+            if refresh_pending {
+              refresh_pending = false;
+              request_segments(
+                &pump_tx,
+                &mut tray_generation,
+                &mut refresh_running,
+                &mut refresh_pending,
+                icon_size,
+              );
+            }
+          }
         }
         PumpEvent::Job(TrayJob::Menu(generation, menu)) if generation == menu_generation => {
           let _ = tx.send(Update::TrayMenu(Some(menu)));
@@ -63,6 +91,7 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
           context_menu,
           x,
           y,
+          menu_x,
         }) => {
           if context_menu && let Some((path, item_theme_path)) = menu_address(&address) {
             menu_generation += 1;
@@ -70,13 +99,16 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
             let _ = tx.send(Update::TrayMenu(Some(pending_menu(
               address.clone(),
               path.clone(),
-              x,
+              menu_x,
             ))));
             let tx = pump_tx.clone();
             thread::spawn(move || {
-              let result = refresh_tray_menu(address.clone(), path, item_theme_path, x)
-                .map(|menu| TrayJob::Menu(generation, menu))
-                .unwrap_or_else(|error| TrayJob::MenuError(generation, address, error.to_string()));
+              let result =
+                refresh_tray_menu(address.clone(), path, item_theme_path, menu_x, icon_size)
+                  .map(|menu| TrayJob::Menu(generation, menu))
+                  .unwrap_or_else(|error| {
+                    TrayJob::MenuError(generation, address, error.to_string())
+                  });
               let _ = tx.send(PumpEvent::Job(result));
             });
             continue;
@@ -103,9 +135,42 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
         PumpEvent::Command(RuntimeCommand::TrayMenuClose) => {
           let _ = tx.send(Update::TrayMenu(None));
         }
+        PumpEvent::Command(RuntimeCommand::TrayScale(scale)) => {
+          let next = tray_icon_size(scale);
+          if icon_size != next {
+            icon_size = next;
+            request_segments(
+              &pump_tx,
+              &mut tray_generation,
+              &mut refresh_running,
+              &mut refresh_pending,
+              icon_size,
+            );
+          }
+        }
       }
     }
   });
+}
+
+fn request_segments(
+  tx: &Sender<PumpEvent>,
+  generation: &mut u64,
+  running: &mut bool,
+  pending: &mut bool,
+  icon_size: u32,
+) {
+  if *running {
+    *pending = true;
+    return;
+  }
+  *generation += 1;
+  *running = true;
+  schedule_segments(tx, *generation, icon_size);
+}
+
+fn tray_icon_size(scale: u32) -> u32 {
+  TRAY_ICON_LOGICAL_SIZE * scale.max(1)
 }
 
 enum PumpEvent {
@@ -159,10 +224,79 @@ impl From<&str> for MenuType {
 type DbusMenuLayout = (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>));
 
 fn watch_tray(tx: Sender<PumpEvent>) {
+  start_watcher(tx.clone());
   let _ = tx.send(PumpEvent::Refresh);
   watch_rule(&tx, "org.kde.StatusNotifierWatcher");
   watch_rule(&tx, "org.kde.StatusNotifierItem");
   watch_rule(&tx, "com.canonical.dbusmenu");
+}
+
+#[derive(Clone)]
+struct StatusNotifierWatcher {
+  items: Arc<Mutex<Vec<String>>>,
+  tx: Sender<PumpEvent>,
+}
+
+#[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+impl StatusNotifierWatcher {
+  fn register_status_notifier_item(&self, service: String, #[zbus(header)] header: Header<'_>) {
+    let address = watcher_address(&service, &header);
+    let mut items = self.items.lock().expect("lock tray watcher items");
+    if !items.contains(&address) {
+      items.push(address);
+      drop(items);
+      let _ = self.tx.send(PumpEvent::Refresh);
+    }
+  }
+
+  fn register_status_notifier_host(&self, _service: String) {}
+
+  #[zbus(property)]
+  fn registered_status_notifier_items(&self) -> Vec<String> {
+    self.items.lock().expect("lock tray watcher items").clone()
+  }
+
+  #[zbus(property)]
+  fn is_status_notifier_host_registered(&self) -> bool {
+    true
+  }
+
+  #[zbus(property)]
+  fn protocol_version(&self) -> i32 {
+    0
+  }
+}
+
+fn start_watcher(tx: Sender<PumpEvent>) {
+  thread::spawn(move || {
+    let watcher = StatusNotifierWatcher {
+      items: Arc::new(Mutex::new(Vec::new())),
+      tx,
+    };
+    let Ok(_connection) = connection::Builder::session()
+      .and_then(|builder| builder.serve_at("/StatusNotifierWatcher", watcher))
+      .and_then(|builder| builder.name("org.kde.StatusNotifierWatcher"))
+      .and_then(|builder| builder.build())
+    else {
+      return;
+    };
+    loop {
+      thread::park();
+    }
+  });
+}
+
+fn watcher_address(service: &str, header: &Header<'_>) -> String {
+  let sender = header.sender().map(|name| name.as_str()).unwrap_or(service);
+  watcher_address_with_sender(service, sender)
+}
+
+fn watcher_address_with_sender(service: &str, sender: &str) -> String {
+  if service.starts_with('/') {
+    format!("{sender}{service}")
+  } else {
+    service.into()
+  }
 }
 
 fn watch_rule(tx: &Sender<PumpEvent>, interface: &'static str) {
@@ -178,10 +312,10 @@ fn watch_rule(tx: &Sender<PumpEvent>, interface: &'static str) {
       return;
     };
     let rule = builder.build();
-    let Ok(mut messages) = MessageIterator::for_match_rule(rule, &connection, Some(32)) else {
+    let Ok(messages) = MessageIterator::for_match_rule(rule, &connection, Some(32)) else {
       return;
     };
-    while let Some(message) = messages.next() {
+    for message in messages {
       if message.is_ok() && tx.send(PumpEvent::Refresh).is_err() {
         return;
       }
@@ -226,6 +360,7 @@ fn refresh_tray_menu(
   path: String,
   item_theme_path: Option<String>,
   x: i32,
+  icon_size: u32,
 ) -> zbus::Result<TrayMenuPopup> {
   let (destination, _) = parse_address(&address);
   let connection = Connection::session()?;
@@ -247,12 +382,13 @@ fn refresh_tray_menu(
     item_theme_path.as_deref().map(Path::new),
     &xdg_data_roots,
     &icon_theme,
+    icon_size,
   );
   Ok(TrayMenuPopup {
     address,
     path,
     x: x.max(0) as f64,
-    y: crate::config::BAR.height as f64,
+    y: 0.0,
     entries,
     open_path: Vec::new(),
   })
@@ -263,7 +399,7 @@ fn pending_menu(address: String, path: String, x: i32) -> TrayMenuPopup {
     address,
     path,
     x: x.max(0) as f64,
-    y: crate::config::BAR.height as f64,
+    y: 0.0,
     entries: vec![TrayMenuEntry {
       id: 0,
       label: "Loading...".into(),
@@ -345,10 +481,11 @@ fn menu_entries(
   item_theme_path: Option<&Path>,
   xdg_data_roots: &[PathBuf],
   icon_theme: &str,
+  icon_size: u32,
 ) -> Vec<TrayMenuEntry> {
   items
     .iter()
-    .filter_map(|item| menu_entry(item, item_theme_path, xdg_data_roots, icon_theme))
+    .filter_map(|item| menu_entry(item, item_theme_path, xdg_data_roots, icon_theme, icon_size))
     .collect()
 }
 
@@ -357,6 +494,7 @@ fn menu_entry(
   item_theme_path: Option<&Path>,
   xdg_data_roots: &[PathBuf],
   icon_theme: &str,
+  icon_size: u32,
 ) -> Option<TrayMenuEntry> {
   if !item.visible {
     return None;
@@ -365,14 +503,22 @@ fn menu_entry(
   let children = item
     .submenu
     .iter()
-    .filter_map(|child| menu_entry(child, item_theme_path, xdg_data_roots, icon_theme))
+    .filter_map(|child| {
+      menu_entry(
+        child,
+        item_theme_path,
+        xdg_data_roots,
+        icon_theme,
+        icon_size,
+      )
+    })
     .collect();
   Some(TrayMenuEntry {
     id: item.id,
     label: item.label.clone().unwrap_or_default(),
     enabled: item.enabled,
     separator,
-    icon: menu_item_icon(item, item_theme_path, xdg_data_roots, icon_theme),
+    icon: menu_item_icon(item, item_theme_path, xdg_data_roots, icon_theme, icon_size),
     children,
   })
 }
@@ -382,21 +528,22 @@ fn menu_item_icon(
   item_theme_path: Option<&Path>,
   xdg_data_roots: &[PathBuf],
   icon_theme: &str,
+  icon_size: u32,
 ) -> Option<Icon> {
   item
     .icon_name
     .as_deref()
     .and_then(|name| {
-      find_icon_path(name, item_theme_path, xdg_data_roots, icon_theme)
-        .and_then(|path| icon_from_path(&path))
+      find_icon_path(name, item_theme_path, xdg_data_roots, icon_theme, icon_size)
+        .and_then(|path| icon_from_path(&path, icon_size))
     })
     .or_else(|| item.icon_data.as_deref().and_then(icon_from_png_data))
 }
 
-fn schedule_segments(tx: &Sender<PumpEvent>, generation: u64) {
+fn schedule_segments(tx: &Sender<PumpEvent>, generation: u64, icon_size: u32) {
   let tx = tx.clone();
   thread::spawn(move || {
-    let segments = segments(tray_items());
+    let segments = segments(tray_items(), icon_size);
     let _ = tx.send(PumpEvent::Job(TrayJob::Segments(generation, segments)));
   });
 }
@@ -408,7 +555,7 @@ fn tray_items() -> Vec<(String, TrayItem)> {
     .collect()
 }
 
-fn segments(items: Vec<(String, TrayItem)>) -> Vec<Segment> {
+fn segments(items: Vec<(String, TrayItem)>, icon_size: u32) -> Vec<Segment> {
   let xdg_data_roots = xdg_data_roots();
   let icon_theme = current_icon_theme();
   items
@@ -423,14 +570,15 @@ fn segments(items: Vec<(String, TrayItem)>) -> Vec<Segment> {
             item.icon_theme_path.as_deref().map(Path::new),
             &xdg_data_roots,
             &icon_theme,
+            icon_size,
           )
-          .and_then(|path| icon_from_path(&path))
+          .and_then(|path| icon_from_path(&path, icon_size))
         })
         .or_else(|| {
           item
             .icon_pixmap
             .iter()
-            .max_by_key(|pixmap| pixmap.0 * pixmap.1)
+            .min_by_key(|(width, height, _)| pixmap_score(*width, *height, icon_size))
             .and_then(|pixmap| icon_from_argb(pixmap.0, pixmap.1, &pixmap.2))
         })
         .map(|icon| Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(address)))
@@ -460,6 +608,11 @@ fn full_addresses() -> Vec<String> {
 fn sort_addresses(mut addresses: Vec<String>) -> Vec<String> {
   addresses.sort();
   addresses
+}
+
+fn pixmap_score(width: i32, height: i32, target: u32) -> (u8, u32) {
+  let candidate = u32::try_from(width.min(height)).unwrap_or(0);
+  size_score(candidate, target)
 }
 
 fn query_item(address: &str) -> Option<TrayItem> {
@@ -626,11 +779,15 @@ fn icon_from_surface(surface: ImageSurface) -> Option<Icon> {
   })
 }
 
-fn icon_from_path(path: &Path) -> Option<Icon> {
+fn icon_from_path(path: &Path, icon_size: u32) -> Option<Icon> {
   let metadata = fs::metadata(path).ok()?;
   let modified = metadata.modified().ok();
   let len = metadata.len();
-  if let Some(cached) = icon_render_cache().lock().ok()?.get(path).cloned()
+  let key = IconRenderKey {
+    path: path.to_path_buf(),
+    icon_size,
+  };
+  if let Some(cached) = icon_render_cache().lock().ok()?.get(&key).cloned()
     && cached.modified == modified
     && cached.len == len
   {
@@ -638,11 +795,11 @@ fn icon_from_path(path: &Path) -> Option<Icon> {
   }
   let icon = match path.extension().and_then(|extension| extension.to_str()) {
     Some("png") => icon_from_png(path),
-    Some("svg") => icon_from_svg(path),
+    Some("svg") => icon_from_svg(path, icon_size),
     _ => None,
   }?;
   icon_render_cache().lock().ok()?.insert(
-    path.to_path_buf(),
+    key,
     CachedIcon {
       modified,
       len,
@@ -652,20 +809,28 @@ fn icon_from_path(path: &Path) -> Option<Icon> {
   Some(icon)
 }
 
-fn icon_from_svg(path: &Path) -> Option<Icon> {
-  let mut options = resvg::usvg::Options::default();
-  options.resources_dir = path.parent().map(Path::to_path_buf);
+fn icon_from_svg(path: &Path, icon_size: u32) -> Option<Icon> {
+  let options = resvg::usvg::Options {
+    resources_dir: path.parent().map(Path::to_path_buf),
+    ..Default::default()
+  };
   let data = fs::read(path).ok()?;
   let tree = resvg::usvg::Tree::from_data(&data, &options).ok()?;
   let size = tree.size().to_int_size();
-  let width = usize::try_from(size.width()).ok()?;
-  let height = usize::try_from(size.height()).ok()?;
-  let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())?;
+  if size.height() == 0 {
+    return None;
+  }
+  let scale = icon_size as f32 / size.height() as f32;
+  let width = (size.width() as f32 * scale).round().max(1.0) as u32;
+  let height = icon_size;
+  let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
   resvg::render(
     &tree,
-    resvg::tiny_skia::Transform::default(),
+    resvg::tiny_skia::Transform::from_scale(scale, scale),
     &mut pixmap.as_mut(),
   );
+  let width = usize::try_from(width).ok()?;
+  let height = usize::try_from(height).ok()?;
   let mut pixels = Vec::with_capacity(width * height * 4);
   for px in pixmap.data().chunks_exact(4) {
     pixels.extend([px[2], px[1], px[0], px[3]]);
@@ -682,11 +847,13 @@ fn find_icon_path(
   item_theme_path: Option<&Path>,
   xdg_data_roots: &[PathBuf],
   theme: &str,
+  icon_size: u32,
 ) -> Option<PathBuf> {
   let key = IconPathKey {
     name: icon_name.to_owned(),
     xdg_data_roots: xdg_data_roots.to_vec(),
     theme: theme.to_owned(),
+    icon_size,
   };
   let cached_path = if item_theme_path.is_none() {
     icon_path_cache().lock().ok()?.get(&key).cloned()
@@ -700,10 +867,19 @@ fn find_icon_path(
     let _ = icon_path_cache().lock().ok()?.remove(&key);
   }
   let icon_roots = icon_roots(item_theme_path, xdg_data_roots);
-  let path = lookup_theme(icon_name, 20, 1, theme, &icon_roots, &mut Vec::new())
+  let path = lookup_theme(icon_name, icon_size, 1, theme, &icon_roots, &mut Vec::new())
     .or_else(|| {
       (theme != "hicolor")
-        .then(|| lookup_theme(icon_name, 20, 1, "hicolor", &icon_roots, &mut Vec::new()))
+        .then(|| {
+          lookup_theme(
+            icon_name,
+            icon_size,
+            1,
+            "hicolor",
+            &icon_roots,
+            &mut Vec::new(),
+          )
+        })
         .flatten()
     })
     .or_else(|| lookup_fallback(icon_name, item_theme_path, xdg_data_roots));
@@ -720,6 +896,13 @@ struct IconPathKey {
   name: String,
   xdg_data_roots: Vec<PathBuf>,
   theme: String,
+  icon_size: u32,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct IconRenderKey {
+  path: PathBuf,
+  icon_size: u32,
 }
 
 #[derive(Clone)]
@@ -730,13 +913,13 @@ struct CachedIcon {
 }
 
 static ICON_PATH_CACHE: OnceLock<Mutex<HashMap<IconPathKey, PathBuf>>> = OnceLock::new();
-static ICON_RENDER_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIcon>>> = OnceLock::new();
+static ICON_RENDER_CACHE: OnceLock<Mutex<HashMap<IconRenderKey, CachedIcon>>> = OnceLock::new();
 
 fn icon_path_cache() -> &'static Mutex<HashMap<IconPathKey, PathBuf>> {
   ICON_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn icon_render_cache() -> &'static Mutex<HashMap<PathBuf, CachedIcon>> {
+fn icon_render_cache() -> &'static Mutex<HashMap<IconRenderKey, CachedIcon>> {
   ICON_RENDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -836,7 +1019,7 @@ fn theme_dirs(theme: &str, roots: &[PathBuf]) -> Option<ThemeDirs> {
     .value("Icon Theme", "Directories")
     .into_iter()
     .chain(parsed.value("Icon Theme", "ScaledDirectories"))
-    .flat_map(|value| split_list(&value))
+    .flat_map(split_list)
     .filter_map(|name| icon_dir(&parsed, &name))
     .collect();
   let theme_dirs = ThemeDirs {
@@ -876,11 +1059,6 @@ static THEME_DIRS_CACHE: OnceLock<Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>>>
 
 fn theme_dirs_cache() -> &'static Mutex<HashMap<ThemeDirsKey, CachedThemeDirs>> {
   THEME_DIRS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(test)]
-fn theme_dirs_cache_len() -> usize {
-  theme_dirs_cache().lock().map_or(0, |cache| cache.len())
 }
 
 struct ThemeIndex {
@@ -969,9 +1147,9 @@ fn lookup_in_theme_dirs(
       if exact {
         return Some(path);
       }
-      let distance = dir_distance(dir, size, scale);
-      if best.as_ref().is_none_or(|(best, _)| distance < *best) {
-        best = Some((distance, path));
+      let score = dir_score(dir, size, scale);
+      if best.as_ref().is_none_or(|(best, _)| score < *best) {
+        best = Some((score, path));
       }
     }
   }
@@ -991,25 +1169,33 @@ fn dir_matches(dir: &IconDir, size: u32, scale: u32) -> bool {
   }
 }
 
-fn dir_distance(dir: &IconDir, size: u32, scale: u32) -> u32 {
+fn dir_score(dir: &IconDir, size: u32, scale: u32) -> (u8, u32) {
   let icon = size * scale;
   match dir.kind {
-    DirKind::Fixed => dir.size.abs_diff(icon),
-    DirKind::Scalable if icon < dir.min * dir.scale => dir.min * dir.scale - icon,
-    DirKind::Scalable if icon > dir.max * dir.scale => icon - dir.max * dir.scale,
-    DirKind::Scalable => 0,
+    DirKind::Fixed => size_score(dir.size * dir.scale, icon),
+    DirKind::Scalable if icon < dir.min * dir.scale => size_score(dir.min * dir.scale, icon),
+    DirKind::Scalable if icon > dir.max * dir.scale => size_score(dir.max * dir.scale, icon),
+    DirKind::Scalable => (0, 0),
     DirKind::Threshold if icon < dir.size.saturating_sub(dir.threshold) * dir.scale => {
-      dir.size.saturating_sub(dir.threshold) * dir.scale - icon
+      size_score(dir.size.saturating_sub(dir.threshold) * dir.scale, icon)
     }
     DirKind::Threshold if icon > (dir.size + dir.threshold) * dir.scale => {
-      icon - (dir.size + dir.threshold) * dir.scale
+      size_score((dir.size + dir.threshold) * dir.scale, icon)
     }
-    DirKind::Threshold => 0,
+    DirKind::Threshold => (0, 0),
+  }
+}
+
+fn size_score(candidate: u32, target: u32) -> (u8, u32) {
+  if candidate >= target {
+    (0, candidate - target)
+  } else {
+    (1, target - candidate)
   }
 }
 
 fn icon_file(dir: &Path, icon: &str) -> Option<PathBuf> {
-  ["png", "svg"]
+  ["svg", "png"]
     .iter()
     .map(|ext| dir.join(format!("{icon}.{ext}")))
     .find(|path| path.exists())
@@ -1078,8 +1264,130 @@ mod tests {
         Some(&item_theme),
         &[root.join("xdg")],
         "hicolor",
+        tray_icon_size(1),
       ),
       Some(item_icon)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn larger_icon() {
+    let root =
+      std::env::temp_dir().join(format!("alpha-bar-tray-large-test-{}", std::process::id()));
+    let small = root.join("share/icons/hicolor/16x16/status/input-keyboard.png");
+    let large = root.join("share/icons/hicolor/32x32/status/input-keyboard.png");
+    fs::create_dir_all(small.parent().unwrap()).unwrap();
+    fs::create_dir_all(large.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=16x16/status,32x32/status\n[16x16/status]\nSize=16\nType=Fixed\n[32x32/status]\nSize=32\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&small, []).unwrap();
+    fs::write(&large, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "hicolor",
+        tray_icon_size(1)
+      ),
+      Some(large)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn high_res_icon() {
+    let root =
+      std::env::temp_dir().join(format!("alpha-bar-tray-hidpi-test-{}", std::process::id()));
+    let normal = root.join("share/icons/hicolor/20x20/status/input-keyboard.png");
+    let high = root.join("share/icons/hicolor/40x40/status/input-keyboard.png");
+    fs::create_dir_all(normal.parent().unwrap()).unwrap();
+    fs::create_dir_all(high.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=20x20/status,40x40/status\n[20x20/status]\nSize=20\nType=Fixed\n[40x40/status]\nSize=40\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&normal, []).unwrap();
+    fs::write(&high, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "hicolor",
+        tray_icon_size(2)
+      ),
+      Some(high)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn scaled_icon_dir() {
+    let root =
+      std::env::temp_dir().join(format!("alpha-bar-tray-scaled-test-{}", std::process::id()));
+    let normal = root.join("share/icons/hicolor/20x20/status/input-keyboard.png");
+    let scaled = root.join("share/icons/hicolor/20x20@2/status/input-keyboard.png");
+    fs::create_dir_all(normal.parent().unwrap()).unwrap();
+    fs::create_dir_all(scaled.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=20x20/status\nScaledDirectories=20x20@2/status\n[20x20/status]\nSize=20\nType=Fixed\n[20x20@2/status]\nSize=20\nScale=2\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&normal, []).unwrap();
+    fs::write(&scaled, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "hicolor",
+        tray_icon_size(2)
+      ),
+      Some(scaled)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn prefer_svg() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-svg-prefer-test-{}",
+      std::process::id()
+    ));
+    let png = root.join("share/icons/hicolor/24x24/status/input-keyboard.png");
+    let svg = root.join("share/icons/hicolor/24x24/status/input-keyboard.svg");
+    fs::create_dir_all(png.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&png, []).unwrap();
+    fs::write(&svg, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "hicolor",
+        tray_icon_size(1)
+      ),
+      Some(svg)
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1101,13 +1409,19 @@ mod tests {
     )
     .unwrap();
 
-    let path = find_icon_path("blueman-action", Some(&root), &[], "hicolor").unwrap();
-    let rendered = icon_from_path(&path).unwrap();
+    let icon_size = tray_icon_size(2);
+    let path = find_icon_path("blueman-action", Some(&root), &[], "hicolor", icon_size).unwrap();
+    let rendered = icon_from_path(&path, icon_size).unwrap();
 
     assert_eq!(path, icon);
-    assert_eq!(rendered.width, 2);
-    assert_eq!(rendered.height, 1);
-    assert_eq!(rendered.pixels, [0, 0, 255, 255, 0, 0, 255, 255]);
+    assert_eq!(rendered.width, 80);
+    assert_eq!(rendered.height, 40);
+    assert!(
+      rendered
+        .pixels
+        .chunks_exact(4)
+        .all(|px| px == [0, 0, 255, 255])
+    );
 
     let _ = fs::remove_dir_all(root);
   }
@@ -1128,11 +1442,23 @@ mod tests {
     fs::write(&icon, []).unwrap();
 
     assert_eq!(
-      find_icon_path("input-keyboard", None, &[root.join("share")], "Selected"),
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1)
+      ),
       Some(icon.clone())
     );
     assert_eq!(
-      find_icon_path("input-keyboard", None, &[root.join("share")], "Selected"),
+      find_icon_path(
+        "input-keyboard",
+        None,
+        &[root.join("share")],
+        "Selected",
+        tray_icon_size(1)
+      ),
       Some(icon)
     );
 
@@ -1170,6 +1496,7 @@ mod tests {
         None,
         &[root.join("first"), root.join("second")],
         "Selected",
+        tray_icon_size(1),
       ),
       Some(first.clone())
     );
@@ -1181,6 +1508,7 @@ mod tests {
         None,
         &[root.join("first"), root.join("second")],
         "Selected",
+        tray_icon_size(1),
       ),
       Some(second)
     );
@@ -1205,13 +1533,25 @@ mod tests {
     fs::write(&icon, []).unwrap();
 
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       Some(icon)
     );
     fs::remove_dir_all(&item_theme).unwrap();
 
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       None
     );
 
@@ -1234,19 +1574,33 @@ mod tests {
     .unwrap();
     fs::write(&icon, []).unwrap();
 
-    let before = theme_dirs_cache_len();
+    let cache_key = ThemeDirsKey {
+      theme: "hicolor".into(),
+      roots: icon_roots(Some(&item_theme), &[]),
+    };
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       Some(icon.clone())
     );
-    let cached = theme_dirs_cache_len();
+    assert!(theme_dirs_cache().lock().unwrap().contains_key(&cache_key));
 
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       Some(icon)
     );
-    assert!(cached > before);
-    assert_eq!(theme_dirs_cache_len(), cached);
+    assert!(theme_dirs_cache().lock().unwrap().contains_key(&cache_key));
 
     let _ = fs::remove_dir_all(root);
   }
@@ -1270,7 +1624,13 @@ mod tests {
     fs::write(&old_icon, []).unwrap();
 
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       Some(old_icon.clone())
     );
 
@@ -1283,7 +1643,13 @@ mod tests {
     fs::write(&new_icon, []).unwrap();
 
     assert_eq!(
-      find_icon_path("input-keyboard", Some(&item_theme), &[], "hicolor"),
+      find_icon_path(
+        "input-keyboard",
+        Some(&item_theme),
+        &[],
+        "hicolor",
+        tray_icon_size(1),
+      ),
       Some(new_icon)
     );
 
@@ -1311,6 +1677,7 @@ mod tests {
         None,
         &[root.join("first"), root.join("second")],
         "hicolor",
+        tray_icon_size(1),
       ),
       None
     );
@@ -1336,6 +1703,7 @@ mod tests {
         None,
         &[root.join("first"), root.join("second")],
         "hicolor",
+        tray_icon_size(1),
       ),
       Some(second_icon)
     );
@@ -1375,19 +1743,67 @@ mod tests {
     )
     .unwrap();
 
-    let rendered = icon_from_path(&icon).unwrap();
+    let icon_size = tray_icon_size(2);
+    let rendered = icon_from_path(&icon, icon_size).unwrap();
     fs::write(
       &icon,
       r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="#ff0000"/></svg>"##,
     )
     .unwrap();
-    let updated = icon_from_path(&icon).unwrap();
+    let updated = icon_from_path(&icon, icon_size).unwrap();
 
     assert_ne!(updated, rendered);
-    assert_eq!(updated.width, 2);
-    assert_eq!(updated.pixels, [0, 0, 255, 255, 0, 0, 255, 255]);
+    assert_eq!(updated.width, 80);
+    assert_eq!(updated.height, 40);
+    assert!(
+      updated
+        .pixels
+        .chunks_exact(4)
+        .all(|px| px == [0, 0, 255, 255])
+    );
 
     let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn icon_render_scales() {
+    let root = std::env::temp_dir().join(format!(
+      "alpha-bar-tray-render-scale-test-{}",
+      std::process::id()
+    ));
+    let icon = root.join("hicolor/scalable/status/input-keyboard.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      &icon,
+      r##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#00ff00"/></svg>"##,
+    )
+    .unwrap();
+
+    let normal = icon_from_path(&icon, tray_icon_size(1)).unwrap();
+    let scaled = icon_from_path(&icon, tray_icon_size(2)).unwrap();
+
+    assert_eq!(normal.height, 20);
+    assert_eq!(scaled.height, 40);
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn pixmap_target_size() {
+    let small = vec![0; 22 * 22 * 4];
+    let large = vec![0; 64 * 64 * 4];
+    let segments = segments(
+      vec![(
+        ":1.2/StatusNotifierItem".into(),
+        TrayItem {
+          icon_pixmap: vec![(22, 22, small), (64, 64, large)],
+          ..Default::default()
+        },
+      )],
+      tray_icon_size(1),
+    );
+
+    assert_eq!(segments[0].icon.as_ref().unwrap().width, 22);
   }
 
   #[test]
@@ -1417,6 +1833,7 @@ mod tests {
         None,
         &[root.join("share")],
         "Selected",
+        tray_icon_size(1),
       ),
       Some(selected)
     );
@@ -1453,7 +1870,7 @@ mod tests {
       ..Default::default()
     }];
 
-    let entries = menu_entries(&menu, None, &[], "hicolor");
+    let entries = menu_entries(&menu, None, &[], "hicolor", tray_icon_size(1));
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].label, "Parent");
@@ -1477,5 +1894,14 @@ mod tests {
     assert_eq!(menu.entries.len(), 1);
     assert_eq!(menu.entries[0].label, "Loading...");
     assert!(!menu.entries[0].enabled);
+  }
+
+  #[test]
+  fn watcher_address_path() {
+    assert_eq!(
+      watcher_address_with_sender("/StatusNotifierItem", ":1.2"),
+      ":1.2/StatusNotifierItem"
+    );
+    assert_eq!(watcher_address_with_sender(":1.3", ":1.2"), ":1.3");
   }
 }

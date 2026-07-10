@@ -1,23 +1,23 @@
-use crate::state::{Segment, Side, Snapshot};
+use crate::state::{Segment, Snapshot};
 
 pub fn build_segments(snapshot: &Snapshot) -> Vec<Segment> {
   let mut segments = snapshot.workspaces.clone();
   if !snapshot.tray.is_empty() {
     segments.extend(snapshot.tray.clone());
   }
-  segments.extend([
+  let right = [
     snapshot.network.clone(),
     snapshot.net_speed.clone(),
     snapshot.audio.clone(),
     snapshot.cpu.clone(),
     snapshot.memory.clone(),
     snapshot.temperature.clone(),
-    snapshot.battery.clone(),
-    snapshot.clock.clone(),
-  ]);
-  segments.sort_by_key(|segment| match segment.side {
-    Side::Left => 0,
-    Side::Right => 1,
-  });
+  ];
+  if let Some(battery) = &snapshot.battery {
+    segments.extend(right.into_iter().chain([battery.clone()]));
+  } else {
+    segments.extend(right);
+  }
+  segments.push(snapshot.clock.clone());
   segments
 }

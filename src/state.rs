@@ -56,7 +56,7 @@ pub struct TrayMenuPopup {
 }
 
 impl TrayMenuPopup {
-  const ROW_HEIGHT: f64 = 24.0;
+  pub const ROW_HEIGHT: f64 = 24.0;
   const ICON_WIDTH: f64 = 28.0;
   const ARROW_WIDTH: f64 = 18.0;
   const MIN_WIDTH: f64 = 160.0;
@@ -184,6 +184,6 @@ pub struct Snapshot {
   pub cpu: Segment,
   pub memory: Segment,
   pub temperature: Segment,
-  pub battery: Segment,
+  pub battery: Option<Segment>,
   pub clock: Segment,
 }

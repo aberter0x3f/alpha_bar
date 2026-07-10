@@ -1,5 +1,6 @@
 use crate::runtime::Update;
 use crate::state::{Class, Segment, Side};
+use chrono::Timelike;
 use std::{sync::mpsc::Sender, thread, time::Duration};
 
 pub fn clock_text(hour: u8, minute: u8) -> String {
@@ -21,10 +22,7 @@ pub fn spawn(tx: Sender<Update>) {
 
 fn current() -> String {
   let now = chrono::Local::now();
-  clock_text(
-    now.format("%H").to_string().parse().unwrap_or(0),
-    now.format("%M").to_string().parse().unwrap_or(0),
-  )
+  clock_text(now.hour() as u8, now.minute() as u8)
 }
 
 #[cfg(test)]

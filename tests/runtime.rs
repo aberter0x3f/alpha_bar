@@ -18,13 +18,16 @@ fn independent_updates() {
     "tray",
   )]));
   state.apply(Update::Cpu(cpu::segment(88)));
-  state.apply(Update::Battery(power::segment("󰂎 9%".into(), "critical")));
+  state.apply(Update::Battery(Some(power::segment(
+    "󰂎 9%".into(),
+    "critical",
+  ))));
 
   let snapshot = state.snapshot();
   assert_eq!(snapshot.audio.text, "󰖁 0%");
   assert_eq!(snapshot.workspaces[1].class, Class::Active);
   assert_eq!(snapshot.tray[0].text, "tray");
   assert_eq!(snapshot.cpu.text, "█ 88%");
-  assert_eq!(snapshot.battery.text, "󰂎 9%");
+  assert_eq!(snapshot.battery.as_ref().unwrap().text, "󰂎 9%");
   assert_eq!(snapshot.memory.text, "󰍛 0%");
 }

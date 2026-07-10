@@ -54,14 +54,21 @@ fn cpu_usage(old: &str, new: &str) -> Option<u8> {
 
 fn cpu_times(input: &str) -> Option<(u64, u64)> {
   let line = input.lines().find(|line| line.starts_with("cpu "))?;
-  let nums = line
-    .split_whitespace()
-    .skip(1)
-    .map(str::parse::<u64>)
-    .collect::<Result<Vec<_>, _>>()
-    .ok()?;
-  let idle = nums.get(3)? + nums.get(4).copied().unwrap_or(0);
-  Some((nums.iter().sum(), idle))
+  let mut total = 0u64;
+  let mut idle = 0u64;
+  let mut has_idle = false;
+  for (index, field) in line.split_whitespace().skip(1).enumerate() {
+    let value = field.parse::<u64>().ok()?;
+    total += value;
+    if index == 3 || index == 4 {
+      idle += value;
+      has_idle = true;
+    }
+  }
+  if !has_idle {
+    return None;
+  }
+  Some((total, idle))
 }
 
 #[cfg(test)]

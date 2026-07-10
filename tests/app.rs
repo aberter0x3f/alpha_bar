@@ -26,7 +26,7 @@ fn segments() {
     cpu: Segment::new(Side::Right, Class::Warning, "▇ 75%"),
     memory: Segment::new(Side::Right, Class::Critical, "󰍛 91%"),
     temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
-    battery: Segment::new(Side::Right, Class::Plugged, " 100%"),
+    battery: Some(Segment::new(Side::Right, Class::Plugged, " 100%")),
     clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
   });
 
@@ -54,10 +54,11 @@ fn empty_tray() {
     cpu: Segment::new(Side::Right, Class::Warning, "▇ 75%"),
     memory: Segment::new(Side::Right, Class::Critical, "󰍛 91%"),
     temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
-    battery: Segment::new(Side::Right, Class::Plugged, " 100%"),
+    battery: None,
     clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
   });
 
   assert_eq!(segments[0].text, "1");
   assert_eq!(segments[1].text, "󰲛 Disconnected");
+  assert!(!segments.iter().any(|segment| segment.text == "󰂑 N/A"));
 }
