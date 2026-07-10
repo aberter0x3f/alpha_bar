@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use crate::runtime::Update;
 use crate::state::{Class, Segment, Side};
@@ -31,8 +31,13 @@ fn temp_c(raw: &str) -> Option<i64> {
 }
 
 fn thermal_temp() -> Option<i64> {
+  thermal_temp_at(Path::new("/sys/class/thermal"))
+}
+
+fn thermal_temp_at(root: &Path) -> Option<i64> {
+  let mut cpu = None;
   let mut fallback = None;
-  for entry in fs::read_dir("/sys/class/thermal").ok()?.flatten() {
+  for entry in fs::read_dir(root).ok()?.flatten() {
     let path = entry.path();
     if !path
       .file_name()
@@ -45,21 +50,45 @@ fn thermal_temp() -> Option<i64> {
       .ok()
       .and_then(|raw| temp_c(&raw));
     let sensor_type = fs::read_to_string(path.join("type")).unwrap_or_default();
-    if sensor_type.contains("cpu") || sensor_type.contains("CPU") || sensor_type.contains("Package")
+    if sensor_type.contains("cpu")
+      || sensor_type.contains("CPU")
+      || sensor_type.contains("Package")
+      || sensor_type.contains("package")
     {
-      return temp;
+      cpu = cpu.max(temp);
+    } else {
+      fallback = fallback.max(temp);
     }
-    fallback = fallback.or(temp);
   }
-  fallback
+  cpu.or(fallback)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::path::Path;
+
+  fn zone(root: &Path, name: &str, sensor_type: &str, temp: &str) {
+    let path = root.join(name);
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("type"), sensor_type).unwrap();
+    fs::write(path.join("temp"), temp).unwrap();
+  }
 
   #[test]
   fn temp() {
     assert_eq!(temp_c("42500\n"), Some(42));
+  }
+
+  #[test]
+  fn cpu_max() {
+    let root = std::env::temp_dir().join(format!("alpha-bar-temp-test-{}", std::process::id()));
+    zone(&root, "thermal_zone0", "cpu_core0", "42000\n");
+    zone(&root, "thermal_zone1", "Package id 0", "71000\n");
+    zone(&root, "thermal_zone2", "acpitz", "99000\n");
+
+    assert_eq!(thermal_temp_at(&root), Some(71));
+
+    let _ = fs::remove_dir_all(root);
   }
 }
