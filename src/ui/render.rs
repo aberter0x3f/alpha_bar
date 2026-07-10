@@ -1,6 +1,6 @@
-use crate::state::{Segment, Side};
+use crate::state::{Segment, Side, TrayMenuPopup};
 use crate::{
-  config::STYLE,
+  config::{BAR, STYLE},
   style::{argb, underline},
 };
 
@@ -14,6 +14,16 @@ pub fn render_segments_scaled(
   scale: u32,
   segments: &[Segment],
 ) -> Vec<u8> {
+  render_ui_scaled(width, height, scale, segments, None)
+}
+
+pub fn render_ui_scaled(
+  width: usize,
+  height: usize,
+  scale: u32,
+  segments: &[Segment],
+  menu: Option<&TrayMenuPopup>,
+) -> Vec<u8> {
   let scale = scale.max(1) as usize;
   let mut surface = cairo::ImageSurface::create(
     cairo::Format::ARgb32,
@@ -24,12 +34,18 @@ pub fn render_segments_scaled(
   let cr = cairo::Context::new(&surface).expect("create cairo context");
   cr.scale(scale as f64, scale as f64);
   set_color(&cr, argb(STYLE.background));
-  cr.paint().expect("paint background");
+  cr.rectangle(
+    0.0,
+    0.0,
+    width as f64,
+    height.min(BAR.height as usize) as f64,
+  );
+  cr.fill().expect("paint background");
 
   let mut left = 8.0;
   for segment in segments.iter().filter(|segment| segment.side == Side::Left) {
     let segment_width = segment_width(&cr, segment);
-    draw_segment(&cr, segment, left, segment_width, height);
+    draw_segment(&cr, segment, left, segment_width, BAR.height as usize);
     left += segment_width;
   }
 
@@ -44,13 +60,63 @@ pub fn render_segments_scaled(
     .filter(|segment| segment.side == Side::Right)
   {
     let segment_width = segment_width(&cr, segment);
-    draw_segment(&cr, segment, right, segment_width, height);
+    draw_segment(&cr, segment, right, segment_width, BAR.height as usize);
     right += segment_width;
+  }
+
+  if let Some(menu) = menu {
+    draw_menu(&cr, menu);
   }
 
   drop(cr);
   surface.flush();
   surface.data().expect("read cairo surface").to_vec()
+}
+
+fn draw_menu(cr: &cairo::Context, menu: &TrayMenuPopup) {
+  let mut x = menu.x;
+  for entries in menu.columns() {
+    let width = TrayMenuPopup::column_width(entries);
+    set_color(cr, argb(STYLE.background));
+    cr.rectangle(x, menu.y, width, entries.len() as f64 * 24.0);
+    cr.fill().expect("fill tray menu");
+    for (index, entry) in entries.iter().enumerate() {
+      let y = menu.y + index as f64 * 24.0;
+      if entry.separator {
+        set_color(cr, argb(STYLE.border_normal));
+        cr.rectangle(x + 8.0, y + 11.0, width - 16.0, 1.0);
+        cr.fill().expect("draw tray menu separator");
+        continue;
+      }
+      if let Some(icon) = &entry.icon {
+        draw_icon(cr, x + 4.0, y + 2.0, icon);
+      }
+      set_color(
+        cr,
+        argb(if entry.enabled {
+          STYLE.foreground
+        } else {
+          STYLE.border_normal
+        }),
+      );
+      cr.move_to(x + 32.0, y + 4.0);
+      let layout = pangocairo::functions::create_layout(cr);
+      layout.set_text(&entry.label);
+      layout.set_font_description(Some(&font_description()));
+      pangocairo::functions::show_layout(cr, &layout);
+      if !entry.children.is_empty() {
+        cr.move_to(x + width - 14.0, y + 4.0);
+        let layout = pangocairo::functions::create_layout(cr);
+        layout.set_text(">");
+        layout.set_font_description(Some(&font_description()));
+        pangocairo::functions::show_layout(cr, &layout);
+      }
+      set_color(cr, argb(STYLE.border_normal));
+      cr.rectangle(x, y + 23.0, width, 1.0);
+      cr.fill().expect("stroke tray menu row");
+    }
+    x += width;
+  }
 }
 
 fn segment_width(cr: &cairo::Context, segment: &Segment) -> f64 {
@@ -82,6 +148,9 @@ fn draw_segment(cr: &cairo::Context, segment: &Segment, x: f64, segment_width: f
 }
 
 fn draw_icon(cr: &cairo::Context, x: f64, y: f64, icon: &crate::state::Icon) {
+  if icon.height == 0 {
+    return;
+  }
   let Ok(surface) = cairo::ImageSurface::create_for_data(
     icon.pixels.clone(),
     cairo::Format::ARgb32,
@@ -113,7 +182,9 @@ fn draw_text_centered(cr: &cairo::Context, x: f64, y: f64, width: f64, text: &st
 }
 
 fn font_description() -> pango::FontDescription {
-  pango::FontDescription::from_string(&format!("{} 16", STYLE.font))
+  let mut font = pango::FontDescription::from_string(STYLE.font);
+  font.set_absolute_size(16.0 * pango::SCALE as f64);
+  font
 }
 
 fn set_color(cr: &cairo::Context, argb: u32) {
@@ -121,4 +192,14 @@ fn set_color(cr: &cairo::Context, argb: u32) {
   let g = ((argb >> 8) & 0xff) as f64 / 255.0;
   let b = (argb & 0xff) as f64 / 255.0;
   cr.set_source_rgb(r, g, b);
+}
+
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn font_pixels() {
+    let font = super::font_description();
+    assert!(font.is_size_absolute());
+    assert_eq!(font.size(), 16 * pango::SCALE);
+  }
 }

@@ -1,73 +1,416 @@
 use std::{
   collections::HashMap,
   fs::{self, File},
+  io::Cursor,
   path::{Path, PathBuf},
-  sync::mpsc::{Receiver, Sender},
+  sync::mpsc::{self, Receiver, Sender},
   thread,
-  time::Duration,
+  time::{SystemTime, UNIX_EPOCH},
 };
 
 use cairo::{Format, ImageSurface};
+use zbus::{
+  MatchRule,
+  blocking::{Connection, MessageIterator, Proxy},
+  zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
+};
 
 use crate::{
   runtime::{RuntimeCommand, Update},
-  state::{Class, Click, Icon, Segment, Side},
+  state::{Class, Click, Icon, Segment, Side, TrayMenuEntry, TrayMenuPopup},
 };
 
 pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
   thread::spawn(move || {
-    let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-      .enable_all()
-      .build()
-    else {
-      return;
-    };
-    rt.block_on(async move {
-      let Ok(client) = system_tray::client::Client::new().await else {
-        return;
-      };
-      let mut events = client.subscribe();
-      let _ = tx.send(Update::Tray(segments(&client).await));
-      loop {
-        tokio::select! {
-          event = events.recv() => {
-            if event.is_err() { return; }
-            let _ = tx.send(Update::Tray(segments(&client).await));
-          }
-          _ = tokio::time::sleep(Duration::from_millis(50)) => {
-            while let Ok(command) = cmd_rx.try_recv() {
-              match command {
-                RuntimeCommand::TrayActivate { address, context_menu, x, y } => {
-                  if context_menu {
-                    let _ = open_context_menu(&address, x, y).await;
-                  } else {
-                    let _ = activate(&address, x, y).await;
-                  }
-                }
-              }
-            }
-          }
+    let (pump_tx, pump_rx) = mpsc::channel();
+    let cmd_tx = pump_tx.clone();
+    thread::spawn(move || {
+      while let Ok(command) = cmd_rx.recv() {
+        if cmd_tx.send(PumpEvent::Command(command)).is_err() {
+          break;
         }
       }
     });
+    watch_tray(pump_tx.clone());
+    let mut tray_generation = 0u64;
+    let mut menu_generation = 0u64;
+    schedule_segments(&pump_tx, tray_generation);
+    while let Ok(event) = pump_rx.recv() {
+      match event {
+        PumpEvent::Refresh => {
+          tray_generation += 1;
+          schedule_segments(&pump_tx, tray_generation);
+        }
+        PumpEvent::Job(TrayJob::Segments(generation, segments))
+          if generation == tray_generation =>
+        {
+          let _ = tx.send(Update::Tray(segments));
+        }
+        PumpEvent::Job(TrayJob::Menu(generation, menu)) if generation == menu_generation => {
+          let _ = tx.send(Update::TrayMenu(Some(menu)));
+        }
+        PumpEvent::Job(TrayJob::MenuError(generation, address, error))
+          if generation == menu_generation =>
+        {
+          eprintln!("tray menu failed for {address}: {error}");
+        }
+        PumpEvent::Job(_) => {}
+        PumpEvent::Command(RuntimeCommand::TrayActivate {
+          address,
+          context_menu,
+          x,
+          y,
+        }) => {
+          if context_menu && let Some((path, item_theme_path)) = menu_address(&address) {
+            menu_generation += 1;
+            let generation = menu_generation;
+            let _ = tx.send(Update::TrayMenu(Some(pending_menu(
+              address.clone(),
+              path.clone(),
+              x,
+            ))));
+            let tx = pump_tx.clone();
+            thread::spawn(move || {
+              let result = refresh_tray_menu(address.clone(), path, item_theme_path, x)
+                .map(|menu| TrayJob::Menu(generation, menu))
+                .unwrap_or_else(|error| TrayJob::MenuError(generation, address, error.to_string()));
+              let _ = tx.send(PumpEvent::Job(result));
+            });
+            continue;
+          }
+          thread::spawn(move || {
+            let result = if context_menu {
+              open_context_menu(&address, x, y)
+            } else {
+              activate(&address, x, y)
+            };
+            if let Err(error) = result {
+              eprintln!("tray click failed for {address}: {error}");
+            }
+          });
+        }
+        PumpEvent::Command(RuntimeCommand::TrayMenuItem { address, path, id }) => {
+          thread::spawn(move || {
+            if let Err(error) = activate_menu_item(&address, &path, id) {
+              eprintln!("tray menu item failed for {address}: {error}");
+            }
+          });
+          let _ = tx.send(Update::TrayMenu(None));
+        }
+        PumpEvent::Command(RuntimeCommand::TrayMenuClose) => {
+          let _ = tx.send(Update::TrayMenu(None));
+        }
+      }
+    }
   });
 }
 
-async fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
-  let items = client.items();
-  let Ok(items) = items.lock() else {
-    return Vec::new();
+enum PumpEvent {
+  Refresh,
+  Command(RuntimeCommand),
+  Job(TrayJob),
+}
+
+enum TrayJob {
+  Segments(u64, Vec<Segment>),
+  Menu(u64, TrayMenuPopup),
+  MenuError(u64, String, String),
+}
+
+#[derive(Clone, Default)]
+struct TrayItem {
+  icon_theme_path: Option<String>,
+  icon_name: Option<String>,
+  icon_pixmap: Vec<(i32, i32, Vec<u8>)>,
+}
+
+#[derive(Clone, Default)]
+struct MenuItem {
+  id: i32,
+  label: Option<String>,
+  enabled: bool,
+  visible: bool,
+  icon_name: Option<String>,
+  icon_data: Option<Vec<u8>>,
+  menu_type: MenuType,
+  submenu: Vec<MenuItem>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum MenuType {
+  Separator,
+  #[default]
+  Standard,
+}
+
+impl From<&str> for MenuType {
+  fn from(value: &str) -> Self {
+    if value == "separator" {
+      Self::Separator
+    } else {
+      Self::Standard
+    }
+  }
+}
+
+type DbusMenuLayout = (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>));
+
+fn watch_tray(tx: Sender<PumpEvent>) {
+  let _ = tx.send(PumpEvent::Refresh);
+  watch_rule(&tx, "org.kde.StatusNotifierWatcher");
+  watch_rule(&tx, "org.kde.StatusNotifierItem");
+  watch_rule(&tx, "com.canonical.dbusmenu");
+}
+
+fn watch_rule(tx: &Sender<PumpEvent>, interface: &'static str) {
+  let tx = tx.clone();
+  thread::spawn(move || {
+    let Ok(connection) = Connection::session() else {
+      return;
+    };
+    let Ok(builder) = MatchRule::builder()
+      .msg_type(zbus::message::Type::Signal)
+      .interface(interface)
+    else {
+      return;
+    };
+    let rule = builder.build();
+    let Ok(mut messages) = MessageIterator::for_match_rule(rule, &connection, Some(32)) else {
+      return;
+    };
+    while let Some(message) = messages.next() {
+      if message.is_ok() && tx.send(PumpEvent::Refresh).is_err() {
+        return;
+      }
+    }
+  });
+}
+
+fn activate_menu_item(address: &str, path: &str, id: i32) -> zbus::Result<()> {
+  let (destination, _) = parse_address(address);
+  let connection = Connection::session()?;
+  let proxy = Proxy::new(&connection, destination, path, "com.canonical.dbusmenu")?;
+  let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_or(0, |duration| duration.as_secs() as u32);
+  proxy.call_method("Event", &(id, "clicked", Value::I32(0), timestamp))?;
+  Ok(())
+}
+
+fn menu_address(address: &str) -> Option<(String, Option<String>)> {
+  let (destination, _) = parse_address(address);
+  let connection = Connection::session().ok()?;
+  let proxy = Proxy::new(
+    &connection,
+    destination,
+    parse_address(address).1,
+    "org.kde.StatusNotifierItem",
+  )
+  .ok()?;
+  let menu = proxy
+    .get_property::<OwnedObjectPath>("Menu")
+    .ok()?
+    .to_string();
+  let theme_path = proxy
+    .get_property::<String>("IconThemePath")
+    .ok()
+    .filter(|path| !path.is_empty());
+  Some((menu, theme_path))
+}
+
+fn refresh_tray_menu(
+  address: String,
+  path: String,
+  item_theme_path: Option<String>,
+  x: i32,
+) -> zbus::Result<TrayMenuPopup> {
+  let (destination, _) = parse_address(&address);
+  let connection = Connection::session()?;
+  let layout = {
+    let proxy = Proxy::new(
+      &connection,
+      destination,
+      path.as_str(),
+      "com.canonical.dbusmenu",
+    )?;
+    let _: bool = proxy.call("AboutToShow", &0i32).unwrap_or(false);
+    proxy.call::<_, _, DbusMenuLayout>("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))?
   };
+  let menu = menu_items_from_layout(layout);
   let xdg_data_roots = xdg_data_roots();
   let icon_theme = current_icon_theme();
-  let addresses = full_addresses().await;
+  let entries = menu_entries(
+    &menu,
+    item_theme_path.as_deref().map(Path::new),
+    &xdg_data_roots,
+    &icon_theme,
+  );
+  Ok(TrayMenuPopup {
+    address,
+    path,
+    x: x.max(0) as f64,
+    y: crate::config::BAR.height as f64,
+    entries,
+    open_path: Vec::new(),
+  })
+}
+
+fn pending_menu(address: String, path: String, x: i32) -> TrayMenuPopup {
+  TrayMenuPopup {
+    address,
+    path,
+    x: x.max(0) as f64,
+    y: crate::config::BAR.height as f64,
+    entries: vec![TrayMenuEntry {
+      id: 0,
+      label: "Loading...".into(),
+      enabled: false,
+      separator: false,
+      icon: None,
+      children: Vec::new(),
+    }],
+    open_path: Vec::new(),
+  }
+}
+
+fn menu_items_from_layout(layout: DbusMenuLayout) -> Vec<MenuItem> {
+  let (_, (_, _, submenus)) = layout;
+  submenus.iter().filter_map(menu_item_from_value).collect()
+}
+
+fn menu_item_from_value(value: &OwnedValue) -> Option<MenuItem> {
+  let structure = value.downcast_ref::<&Structure>().ok()?;
+  let mut fields = structure.fields().iter();
+  let mut menu = MenuItem {
+    enabled: true,
+    visible: true,
+    ..Default::default()
+  };
+  if let Some(Value::I32(id)) = fields.next() {
+    menu.id = *id;
+  }
+  if let Some(Value::Dict(dict)) = fields.next() {
+    menu.label = dict
+      .get::<&str, &str>(&"label")
+      .ok()
+      .flatten()
+      .map(|label| label.replace('_', ""));
+    menu.enabled = dict
+      .get::<&str, bool>(&"enabled")
+      .ok()
+      .flatten()
+      .unwrap_or(true);
+    menu.visible = dict
+      .get::<&str, bool>(&"visible")
+      .ok()
+      .flatten()
+      .unwrap_or(true);
+    menu.icon_name = dict
+      .get::<&str, &str>(&"icon-name")
+      .ok()
+      .flatten()
+      .map(str::to_owned);
+    menu.icon_data = dict
+      .get::<&str, &Array>(&"icon-data")
+      .ok()
+      .flatten()
+      .and_then(|array| {
+        array
+          .iter()
+          .map(|value| value.downcast_ref::<u8>().ok())
+          .collect()
+      });
+    menu.menu_type = dict
+      .get::<&str, &str>(&"type")
+      .ok()
+      .flatten()
+      .map(MenuType::from)
+      .unwrap_or_default();
+  }
+  if let Some(Value::Array(array)) = fields.next() {
+    menu.submenu = array
+      .iter()
+      .filter_map(|value| OwnedValue::try_from(value).ok())
+      .filter_map(|value| menu_item_from_value(&value))
+      .collect();
+  }
+  Some(menu)
+}
+
+fn menu_entries(
+  items: &[MenuItem],
+  item_theme_path: Option<&Path>,
+  xdg_data_roots: &[PathBuf],
+  icon_theme: &str,
+) -> Vec<TrayMenuEntry> {
   items
     .iter()
-    .filter_map(|(address, (item, _))| {
-      let click_address = addresses
-        .get(address.as_str())
-        .cloned()
-        .unwrap_or_else(|| address.clone());
+    .filter_map(|item| menu_entry(item, item_theme_path, xdg_data_roots, icon_theme))
+    .collect()
+}
+
+fn menu_entry(
+  item: &MenuItem,
+  item_theme_path: Option<&Path>,
+  xdg_data_roots: &[PathBuf],
+  icon_theme: &str,
+) -> Option<TrayMenuEntry> {
+  if !item.visible {
+    return None;
+  }
+  let separator = item.menu_type == MenuType::Separator;
+  let children = item
+    .submenu
+    .iter()
+    .filter_map(|child| menu_entry(child, item_theme_path, xdg_data_roots, icon_theme))
+    .collect();
+  Some(TrayMenuEntry {
+    id: item.id,
+    label: item.label.clone().unwrap_or_default(),
+    enabled: item.enabled,
+    separator,
+    icon: menu_item_icon(item, item_theme_path, xdg_data_roots, icon_theme),
+    children,
+  })
+}
+
+fn menu_item_icon(
+  item: &MenuItem,
+  item_theme_path: Option<&Path>,
+  xdg_data_roots: &[PathBuf],
+  icon_theme: &str,
+) -> Option<Icon> {
+  item
+    .icon_name
+    .as_deref()
+    .and_then(|name| {
+      find_icon_path(name, item_theme_path, xdg_data_roots, icon_theme)
+        .and_then(|path| icon_from_path(&path))
+    })
+    .or_else(|| item.icon_data.as_deref().and_then(icon_from_png_data))
+}
+
+fn schedule_segments(tx: &Sender<PumpEvent>, generation: u64) {
+  let tx = tx.clone();
+  thread::spawn(move || {
+    let segments = segments(tray_items());
+    let _ = tx.send(PumpEvent::Job(TrayJob::Segments(generation, segments)));
+  });
+}
+
+fn tray_items() -> Vec<(String, TrayItem)> {
+  full_addresses()
+    .into_iter()
+    .filter_map(|address| query_item(&address).map(|item| (address, item)))
+    .collect()
+}
+
+fn segments(items: Vec<(String, TrayItem)>) -> Vec<Segment> {
+  let xdg_data_roots = xdg_data_roots();
+  let icon_theme = current_icon_theme();
+  items
+    .into_iter()
+    .filter_map(|(address, item)| {
       item
         .icon_name
         .as_deref()
@@ -83,59 +426,71 @@ async fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
         .or_else(|| {
           item
             .icon_pixmap
-            .as_ref()
-            .and_then(|pixmaps| {
-              pixmaps
-                .iter()
-                .max_by_key(|pixmap| pixmap.width * pixmap.height)
-            })
-            .and_then(|pixmap| icon_from_argb(pixmap.width, pixmap.height, &pixmap.pixels))
+            .iter()
+            .max_by_key(|pixmap| pixmap.0 * pixmap.1)
+            .and_then(|pixmap| icon_from_argb(pixmap.0, pixmap.1, &pixmap.2))
         })
-        .map(|icon| {
-          Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(click_address))
-        })
+        .map(|icon| Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(address)))
     })
     .collect()
 }
 
-async fn full_addresses() -> HashMap<String, String> {
-  let Ok(connection) = zbus::Connection::session().await else {
-    return HashMap::new();
+fn full_addresses() -> Vec<String> {
+  let Ok(connection) = Connection::session() else {
+    return Vec::new();
   };
-  let Ok(proxy) = zbus::Proxy::new(
+  let Ok(proxy) = Proxy::new(
     &connection,
     "org.kde.StatusNotifierWatcher",
     "/StatusNotifierWatcher",
     "org.kde.StatusNotifierWatcher",
-  )
-  .await
-  else {
-    return HashMap::new();
+  ) else {
+    return Vec::new();
   };
-  proxy
-    .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|address| (parse_address(&address).0.to_owned(), address))
-    .collect()
+  sort_addresses(
+    proxy
+      .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
+      .unwrap_or_default(),
+  )
 }
 
-async fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
+fn sort_addresses(mut addresses: Vec<String>) -> Vec<String> {
+  addresses.sort();
+  addresses
+}
+
+fn query_item(address: &str) -> Option<TrayItem> {
   let (destination, path) = parse_address(address);
-  let connection = zbus::Connection::session().await?;
-  let proxy =
-    zbus::Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
-  proxy.call_method("ContextMenu", &(x, y)).await?;
+  let connection = Connection::session().ok()?;
+  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").ok()?;
+  Some(TrayItem {
+    icon_theme_path: proxy
+      .get_property::<String>("IconThemePath")
+      .ok()
+      .filter(|path| !path.is_empty()),
+    icon_name: proxy
+      .get_property::<String>("IconName")
+      .ok()
+      .filter(|name| !name.is_empty()),
+    icon_pixmap: proxy
+      .get_property::<Vec<(i32, i32, Vec<u8>)>>("IconPixmap")
+      .unwrap_or_default(),
+  })
+}
+
+fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
+  let (destination, path) = parse_address(address);
+  let connection = Connection::session()?;
+  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
+  proxy.call_method("ContextMenu", &(x, y))?;
   Ok(())
 }
 
-async fn activate(address: &str, x: i32, y: i32) -> zbus::Result<()> {
+fn activate(address: &str, x: i32, y: i32) -> zbus::Result<()> {
   let (destination, path) = parse_address(address);
-  let connection = zbus::Connection::session().await?;
-  let proxy =
-    zbus::Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
-  proxy.call_method("Activate", &(x, y)).await?;
+  let connection = Connection::session()?;
+  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
+  proxy.call_method("Activate", &(x, y))?;
   Ok(())
 }
 
@@ -236,6 +591,16 @@ fn icon_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Icon> {
 fn icon_from_png(path: &Path) -> Option<Icon> {
   let mut file = File::open(path).ok()?;
   let surface = ImageSurface::create_from_png(&mut file).ok()?;
+  icon_from_surface(surface)
+}
+
+fn icon_from_png_data(data: &[u8]) -> Option<Icon> {
+  let mut cursor = Cursor::new(data);
+  let surface = ImageSurface::create_from_png(&mut cursor).ok()?;
+  icon_from_surface(surface)
+}
+
+fn icon_from_surface(surface: ImageSurface) -> Option<Icon> {
   let width = usize::try_from(surface.width()).ok()?;
   let height = usize::try_from(surface.height()).ok()?;
   let stride = usize::try_from(surface.stride()).ok()?;
@@ -646,5 +1011,48 @@ mod tests {
       parse_address(":1.59/org/ayatana/NotificationItem/nm_applet"),
       (":1.59", "/org/ayatana/NotificationItem/nm_applet".into())
     );
+  }
+
+  #[test]
+  fn menu_tree() {
+    let menu = vec![MenuItem {
+      id: 1,
+      label: Some("Parent".into()),
+      enabled: true,
+      visible: true,
+      submenu: vec![MenuItem {
+        id: 2,
+        label: Some("Child".into()),
+        enabled: true,
+        visible: true,
+        ..Default::default()
+      }],
+      ..Default::default()
+    }];
+
+    let entries = menu_entries(&menu, None, &[], "hicolor");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].label, "Parent");
+    assert_eq!(entries[0].children[0].label, "Child");
+  }
+
+  #[test]
+  fn tray_order() {
+    let addresses = vec![":1.9/Z".into(), ":1.2/A".into(), ":1.10/B".into()];
+
+    assert_eq!(
+      sort_addresses(addresses),
+      vec![":1.10/B", ":1.2/A", ":1.9/Z"]
+    );
+  }
+
+  #[test]
+  fn loading_menu() {
+    let menu = pending_menu(":1.2/StatusNotifierItem".into(), "/menu".into(), 12);
+
+    assert_eq!(menu.entries.len(), 1);
+    assert_eq!(menu.entries[0].label, "Loading...");
+    assert!(!menu.entries[0].enabled);
   }
 }

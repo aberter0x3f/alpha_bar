@@ -2,12 +2,13 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::{
   modules::{audio, clock, cpu, memory, net_speed, network, niri, power, temperature, tray},
-  state::{Class, Segment, Side, Snapshot},
+  state::{Class, Segment, Side, Snapshot, TrayMenuPopup},
 };
 
 pub enum Update {
   Workspaces(Vec<Segment>),
   Tray(Vec<Segment>),
+  TrayMenu(Option<TrayMenuPopup>),
   Network(Segment),
   NetSpeed(Segment),
   Audio(Segment),
@@ -25,6 +26,12 @@ pub enum RuntimeCommand {
     x: i32,
     y: i32,
   },
+  TrayMenuItem {
+    address: String,
+    path: String,
+    id: i32,
+  },
+  TrayMenuClose,
 }
 
 pub struct RuntimeState {
@@ -37,6 +44,7 @@ impl Default for RuntimeState {
       snapshot: Snapshot {
         workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
         tray: Vec::new(),
+        tray_menu: None,
         network: network::segment("󰲛 Disconnected".into()),
         net_speed: net_speed::default_segment(),
         audio: audio::segment("󰖁 0%".into()),
@@ -55,6 +63,7 @@ impl RuntimeState {
     match update {
       Update::Workspaces(v) => self.snapshot.workspaces = v,
       Update::Tray(v) => self.snapshot.tray = v,
+      Update::TrayMenu(v) => self.snapshot.tray_menu = v,
       Update::Network(v) => self.snapshot.network = v,
       Update::NetSpeed(v) => self.snapshot.net_speed = v,
       Update::Audio(v) => self.snapshot.audio = v,

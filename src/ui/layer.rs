@@ -1,5 +1,7 @@
 use std::{
+  io,
   num::NonZeroU32,
+  os::fd::{AsRawFd, BorrowedFd},
   sync::mpsc::{Receiver, Sender},
   thread,
   time::Duration,
@@ -33,9 +35,9 @@ use crate::{
   app::build_segments,
   config::BAR,
   runtime::{RuntimeCommand, RuntimeState, Update},
-  state::{Click, Segment},
-  ui::input::click_at,
-  ui::render::render_segments_scaled,
+  state::{Click, Segment, TrayMenuHit, TrayMenuPopup},
+  ui::input::click_target,
+  ui::render::render_ui_scaled,
 };
 
 pub fn run(
@@ -69,8 +71,10 @@ pub fn run(
     pointer: None,
     width: 1,
     height: BAR.height,
+    menu_open: false,
     scale: 1,
     segments: segments_from_state(&state),
+    menu: state.snapshot().tray_menu.clone(),
     closed: false,
     dirty: false,
     cmd_tx,
@@ -91,16 +95,59 @@ pub fn run(
     }
     if dirty || bar.dirty {
       bar.segments = segments_from_state(&state);
-      bar.draw();
-      queue.flush()?;
+      bar.menu = merge_menu(bar.menu.take(), state.snapshot().tray_menu.clone());
+      if bar.set_menu_open(state.snapshot().tray_menu.is_some()) {
+        queue.flush()?;
+      } else {
+        bar.draw();
+        queue.flush()?;
+      }
     }
-    thread::sleep(Duration::from_millis(100));
+    queue.flush()?;
+    if let Some(read) = queue.prepare_read() {
+      if fd_readable(read.connection_fd(), 100)? {
+        read.read()?;
+      }
+    } else {
+      thread::sleep(Duration::from_millis(10));
+    }
   }
   Ok(())
 }
 
+fn fd_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> io::Result<bool> {
+  let mut poll_fd = libc::pollfd {
+    fd: fd.as_raw_fd(),
+    events: libc::POLLIN,
+    revents: 0,
+  };
+  loop {
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if ready >= 0 {
+      return Ok(ready > 0 && poll_fd.revents & libc::POLLIN != 0);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::Interrupted {
+      return Err(error);
+    }
+  }
+}
+
 fn segments_from_state(state: &RuntimeState) -> Vec<Segment> {
   build_segments(state.snapshot())
+}
+
+fn merge_menu(
+  current: Option<TrayMenuPopup>,
+  mut next: Option<TrayMenuPopup>,
+) -> Option<TrayMenuPopup> {
+  if let (Some(current), Some(next_menu)) = (&current, &mut next)
+    && current.address == next_menu.address
+    && current.path == next_menu.path
+  {
+    next_menu.open_path.clone_from(&current.open_path);
+  }
+  next
 }
 
 struct BarLayer {
@@ -113,8 +160,10 @@ struct BarLayer {
   pointer: Option<wl_pointer::WlPointer>,
   width: u32,
   height: u32,
+  menu_open: bool,
   scale: u32,
   segments: Vec<Segment>,
+  menu: Option<TrayMenuPopup>,
   closed: bool,
   dirty: bool,
   cmd_tx: Sender<RuntimeCommand>,
@@ -176,21 +225,71 @@ impl PointerHandler for BarLayer {
         BTN_RIGHT => true,
         _ => continue,
       };
-      if let Some(Click::Tray(address)) =
-        click_at(self.width as usize, event.position.0, &self.segments)
-      {
-        let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
-          address,
-          context_menu,
-          x: event.position.0.round() as i32,
-          y: event.position.1.round() as i32,
-        });
+      if let Some(menu) = self.menu.as_mut() {
+        match menu.hit(event.position.0, event.position.1) {
+          TrayMenuHit::Activate { id } => {
+            let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
+              address: menu.address.clone(),
+              path: menu.path.clone(),
+              id,
+            });
+            continue;
+          }
+          TrayMenuHit::OpenSubmenu { path } => {
+            menu.open_path = path;
+            self.draw();
+            continue;
+          }
+          TrayMenuHit::Outside => {
+            let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
+            continue;
+          }
+        }
+      }
+      match click_target(
+        self.width as usize,
+        BAR.height as usize,
+        event.position.0,
+        event.position.1,
+        &self.segments,
+        self.menu.as_ref(),
+      ) {
+        Some(Click::Tray(address)) => {
+          let _ = self.cmd_tx.send(RuntimeCommand::TrayActivate {
+            address,
+            context_menu,
+            x: event.position.0.round() as i32,
+            y: event.position.1.round() as i32,
+          });
+        }
+        None => {}
       }
     }
   }
 }
 
 impl BarLayer {
+  fn set_menu_open(&mut self, open: bool) -> bool {
+    if self.menu_open != open {
+      self.menu_open = open;
+      if open {
+        self
+          .layer
+          .set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        self.layer.set_size(0, 0);
+      } else {
+        self
+          .layer
+          .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+        self.layer.set_size(0, BAR.height);
+      }
+      self.layer.set_exclusive_zone(BAR.height as i32);
+      self.layer.commit();
+      return true;
+    }
+    false
+  }
+
   fn draw(&mut self) {
     self.dirty = false;
     let buffer_width = self.width * self.scale;
@@ -205,13 +304,14 @@ impl BarLayer {
         wl_shm::Format::Argb8888,
       )
       .expect("create wayland buffer");
-    let pixels = render_segments_scaled(
+    let pixels = render_ui_scaled(
       self.width as usize,
       self.height as usize,
       self.scale,
       &self.segments,
+      self.menu.as_ref(),
     );
-    canvas.copy_from_slice(&pixels);
+    copy_pixels(canvas, &pixels);
     self.layer.wl_surface().set_buffer_scale(self.scale as i32);
     self
       .layer
@@ -222,6 +322,12 @@ impl BarLayer {
       .expect("attach wayland buffer");
     self.layer.commit();
   }
+}
+
+fn copy_pixels(canvas: &mut [u8], pixels: &[u8]) {
+  canvas.fill(0);
+  let len = canvas.len().min(pixels.len());
+  canvas[..len].copy_from_slice(&pixels[..len]);
 }
 
 impl CompositorHandler for BarLayer {
@@ -319,4 +425,51 @@ impl ProvidesRegistryState for BarLayer {
     &mut self.registry
   }
   registry_handlers![OutputState, SeatState];
+}
+
+#[cfg(test)]
+mod tests {
+  use crate::state::{TrayMenuEntry, TrayMenuPopup};
+  use std::{io::Write, os::fd::AsFd, os::unix::net::UnixStream};
+
+  fn menu(address: &str) -> TrayMenuPopup {
+    TrayMenuPopup {
+      address: address.into(),
+      path: "/menu".into(),
+      x: 0.0,
+      y: 32.0,
+      entries: vec![TrayMenuEntry {
+        id: 1,
+        label: "Menu".into(),
+        enabled: true,
+        separator: false,
+        icon: None,
+        children: Vec::new(),
+      }],
+      open_path: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn fd_ready() {
+    let (mut write, read) = UnixStream::pair().unwrap();
+    assert!(!super::fd_readable(read.as_fd(), 0).unwrap());
+    write.write_all(&[1]).unwrap();
+    assert!(super::fd_readable(read.as_fd(), 100).unwrap());
+  }
+
+  #[test]
+  fn copy_short_pixels() {
+    let mut canvas = [9; 6];
+    super::copy_pixels(&mut canvas, &[1, 2, 3, 4]);
+    assert_eq!(canvas, [1, 2, 3, 4, 0, 0]);
+  }
+
+  #[test]
+  fn keep_submenu_path() {
+    let mut current = menu(":1.1/StatusNotifierItem");
+    current.open_path = vec![0];
+    let merged = super::merge_menu(Some(current), Some(menu(":1.1/StatusNotifierItem"))).unwrap();
+    assert_eq!(merged.open_path, vec![0]);
+  }
 }

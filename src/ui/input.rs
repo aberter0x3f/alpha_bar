@@ -1,4 +1,15 @@
-use crate::state::{Click, Segment, Side};
+use crate::state::{Click, Segment, Side, TrayMenuPopup};
+
+pub fn click_target(
+  width: usize,
+  bar_height: usize,
+  x: f64,
+  y: f64,
+  segments: &[Segment],
+  _menu: Option<&TrayMenuPopup>,
+) -> Option<Click> {
+  (y < bar_height as f64).then(|| click_at(width, x, segments))?
+}
 
 pub fn click_at(width: usize, x: f64, segments: &[Segment]) -> Option<Click> {
   let right_width = segments

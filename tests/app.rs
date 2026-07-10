@@ -19,6 +19,7 @@ fn segments() {
         pixels: vec![0, 0, 0, 255],
       },
     )],
+    tray_menu: None,
     network: Segment::new(Side::Right, Class::Disconnected, "󰲛 Disconnected"),
     net_speed: Segment::new(Side::Right, Class::Normal, "↓ 0 K ↑ 0 K"),
     audio: Segment::new(Side::Right, Class::Muted, "󰖁 0%"),
@@ -46,6 +47,7 @@ fn empty_tray() {
   let segments = build_segments(&Snapshot {
     workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
     tray: Vec::new(),
+    tray_menu: None,
     network: Segment::new(Side::Right, Class::Disconnected, "󰲛 Disconnected"),
     net_speed: Segment::new(Side::Right, Class::Normal, "↓ 0 K ↑ 0 K"),
     audio: Segment::new(Side::Right, Class::Muted, "󰖁 0%"),
