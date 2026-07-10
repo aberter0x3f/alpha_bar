@@ -1,6 +1,6 @@
 use alpha_bar::{
-  app::{Snapshot, build_segments},
-  state::{Class, Icon, Segment, Side},
+  app::build_segments,
+  state::{Class, Icon, Segment, Side, Snapshot},
 };
 
 #[test]
@@ -19,15 +19,14 @@ fn segments() {
         pixels: vec![0, 0, 0, 255],
       },
     )],
-    network: "󰲛 Disconnected".into(),
-    net_speed: "↓ 0 K ↑ 0 K".into(),
-    audio: "󰖁 0%".into(),
-    cpu: 75,
-    memory: 91,
-    temperature: 82,
-    battery: " 100%".into(),
-    battery_class: Class::Plugged,
-    clock: "󰥔 09:05".into(),
+    network: Segment::new(Side::Right, Class::Disconnected, "󰲛 Disconnected"),
+    net_speed: Segment::new(Side::Right, Class::Normal, "↓ 0 K ↑ 0 K"),
+    audio: Segment::new(Side::Right, Class::Muted, "󰖁 0%"),
+    cpu: Segment::new(Side::Right, Class::Warning, "▇ 75%"),
+    memory: Segment::new(Side::Right, Class::Critical, "󰍛 91%"),
+    temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
+    battery: Segment::new(Side::Right, Class::Plugged, " 100%"),
+    clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
   });
 
   assert_eq!(segments[0].side, Side::Left);
@@ -47,15 +46,14 @@ fn empty_tray_is_not_rendered() {
   let segments = build_segments(&Snapshot {
     workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
     tray: Vec::new(),
-    network: "󰲛 Disconnected".into(),
-    net_speed: "↓ 0 K ↑ 0 K".into(),
-    audio: "󰖁 0%".into(),
-    cpu: 75,
-    memory: 91,
-    temperature: 82,
-    battery: " 100%".into(),
-    battery_class: Class::Plugged,
-    clock: "󰥔 09:05".into(),
+    network: Segment::new(Side::Right, Class::Disconnected, "󰲛 Disconnected"),
+    net_speed: Segment::new(Side::Right, Class::Normal, "↓ 0 K ↑ 0 K"),
+    audio: Segment::new(Side::Right, Class::Muted, "󰖁 0%"),
+    cpu: Segment::new(Side::Right, Class::Warning, "▇ 75%"),
+    memory: Segment::new(Side::Right, Class::Critical, "󰍛 91%"),
+    temperature: Segment::new(Side::Right, Class::Critical, "󰔄 82"),
+    battery: Segment::new(Side::Right, Class::Plugged, " 100%"),
+    clock: Segment::new(Side::Right, Class::Normal, "󰥔 09:05"),
   });
 
   assert_eq!(segments[0].text, "1");

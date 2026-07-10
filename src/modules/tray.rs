@@ -1,13 +1,185 @@
 use std::{
   fs::{self, File},
   path::{Path, PathBuf},
+  sync::mpsc::{Receiver, Sender},
+  thread,
+  time::Duration,
 };
 
 use cairo::{Format, ImageSurface};
+use system_tray::client::ActivateRequest;
 
-use crate::state::Icon;
+use crate::{
+  runtime::{RuntimeCommand, Update},
+  state::{Class, Click, Icon, Segment, Side},
+};
 
-pub fn icon_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Icon> {
+pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
+  thread::spawn(move || {
+    let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+    else {
+      return;
+    };
+    rt.block_on(async move {
+      let Ok(client) = system_tray::client::Client::new().await else {
+        return;
+      };
+      let mut events = client.subscribe();
+      let _ = tx.send(Update::Tray(segments(&client)));
+      loop {
+        tokio::select! {
+          event = events.recv() => {
+            if event.is_err() { return; }
+            let _ = tx.send(Update::Tray(segments(&client)));
+          }
+          _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            while let Ok(command) = cmd_rx.try_recv() {
+              match command {
+                RuntimeCommand::TrayActivate { address, context_menu, x, y } => {
+                  if context_menu {
+                    let _ = open_context_menu(&address, x, y).await;
+                  } else {
+                    let _ = client.activate(ActivateRequest::Default { address, x, y }).await;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+  });
+}
+
+fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
+  let items = client.items();
+  let Ok(items) = items.lock() else {
+    return Vec::new();
+  };
+  let xdg_data_roots = xdg_data_roots();
+  let icon_theme = current_icon_theme();
+  items
+    .iter()
+    .filter_map(|(address, (item, _))| {
+      item
+        .icon_name
+        .as_deref()
+        .and_then(|name| {
+          find_icon_path(
+            name,
+            item.icon_theme_path.as_deref().map(Path::new),
+            &xdg_data_roots,
+            &icon_theme,
+          )
+          .and_then(|path| icon_from_path(&path))
+        })
+        .or_else(|| {
+          item
+            .icon_pixmap
+            .as_ref()
+            .and_then(|pixmaps| {
+              pixmaps
+                .iter()
+                .max_by_key(|pixmap| pixmap.width * pixmap.height)
+            })
+            .and_then(|pixmap| icon_from_argb(pixmap.width, pixmap.height, &pixmap.pixels))
+        })
+        .map(|icon| {
+          Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(address.clone()))
+        })
+    })
+    .collect()
+}
+
+async fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
+  let (destination, path) = parse_address(address);
+  let connection = zbus::Connection::session().await?;
+  let proxy =
+    zbus::Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
+  proxy.call_method("ContextMenu", &(x, y)).await?;
+  Ok(())
+}
+
+fn parse_address(address: &str) -> (&str, String) {
+  address.split_once('/').map_or(
+    (address, "/StatusNotifierItem".into()),
+    |(destination, path)| (destination, format!("/{path}")),
+  )
+}
+
+fn current_icon_theme() -> String {
+  let dirs = config_dirs();
+  dirs
+    .iter()
+    .find_map(|dir| read_icon_theme(&dir.join("gtk-3.0/settings.ini")))
+    .or_else(|| {
+      dirs
+        .iter()
+        .find_map(|dir| read_icon_theme(&dir.join("gtk-4.0/settings.ini")))
+    })
+    .or_else(|| {
+      dirs
+        .iter()
+        .find_map(|dir| read_kde_icon_theme(&dir.join("kdeglobals")))
+    })
+    .unwrap_or_else(|| "hicolor".into())
+}
+
+fn config_dirs() -> Vec<PathBuf> {
+  if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+    vec![PathBuf::from(dir)]
+  } else if let Some(home) = std::env::var_os("HOME") {
+    vec![PathBuf::from(home).join(".config")]
+  } else {
+    Vec::new()
+  }
+}
+
+fn read_icon_theme(path: &Path) -> Option<String> {
+  fs::read_to_string(path)
+    .ok()?
+    .lines()
+    .map(str::trim)
+    .find_map(|line| {
+      line
+        .strip_prefix("gtk-icon-theme-name=")
+        .map(str::trim)
+        .map(str::to_owned)
+    })
+    .filter(|name| !name.is_empty())
+}
+
+fn read_kde_icon_theme(path: &Path) -> Option<String> {
+  let mut in_icons = false;
+  for line in fs::read_to_string(path).ok()?.lines().map(str::trim) {
+    if line.starts_with('[') && line.ends_with(']') {
+      in_icons = &line[1..line.len() - 1] == "Icons";
+    } else if in_icons
+      && let Some(theme) = line.strip_prefix("Theme=").map(str::trim)
+      && !theme.is_empty()
+    {
+      return Some(theme.to_owned());
+    }
+  }
+  None
+}
+
+fn xdg_data_roots() -> Vec<PathBuf> {
+  let mut roots = vec![PathBuf::from("/run/current-system/sw/share")];
+  if let Some(home) = std::env::var_os("XDG_DATA_HOME") {
+    roots.push(PathBuf::from(home));
+  } else if let Some(home) = std::env::var_os("HOME") {
+    roots.push(PathBuf::from(home).join(".local/share"));
+  }
+  if let Some(dirs) = std::env::var_os("XDG_DATA_DIRS") {
+    roots.extend(std::env::split_paths(&dirs));
+  }
+  roots
+}
+
+fn icon_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Icon> {
   let width = usize::try_from(width).ok()?;
   let height = usize::try_from(height).ok()?;
   if argb.len() != width * height * 4 {
@@ -24,7 +196,7 @@ pub fn icon_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Icon> {
   })
 }
 
-pub fn icon_from_png(path: &Path) -> Option<Icon> {
+fn icon_from_png(path: &Path) -> Option<Icon> {
   let mut file = File::open(path).ok()?;
   let surface = ImageSurface::create_from_png(&mut file).ok()?;
   let width = usize::try_from(surface.width()).ok()?;
@@ -49,7 +221,7 @@ pub fn icon_from_png(path: &Path) -> Option<Icon> {
   })
 }
 
-pub fn icon_from_path(path: &Path) -> Option<Icon> {
+fn icon_from_path(path: &Path) -> Option<Icon> {
   match path.extension().and_then(|extension| extension.to_str()) {
     Some("png") => icon_from_png(path),
     Some("svg") => icon_from_svg(path),
@@ -85,7 +257,7 @@ fn icon_from_svg(path: &Path) -> Option<Icon> {
   })
 }
 
-pub fn find_icon_path(
+fn find_icon_path(
   icon_name: &str,
   item_theme_path: Option<&Path>,
   xdg_data_roots: &[PathBuf],
@@ -317,4 +489,113 @@ fn split_list(value: &str) -> Vec<String> {
     .filter(|item| !item.is_empty())
     .map(str::to_owned)
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+
+  #[test]
+  fn argb_icon_to_bgra() {
+    let icon = icon_from_argb(1, 1, &[0xff, 0xff, 0x00, 0x00]).unwrap();
+    assert_eq!(icon.pixels, [0x00, 0x00, 0xff, 0xff]);
+  }
+
+  #[test]
+  fn finds_png_icon_from_item_theme_path_first() {
+    let root = std::env::temp_dir().join(format!("alpha-bar-tray-test-{}", std::process::id()));
+    let item_theme = root.join("item-theme");
+    let xdg_theme = root.join("xdg/icons/hicolor");
+    let item_icon = item_theme.join("hicolor/24x24/status/blueman-action.png");
+    let xdg_icon = xdg_theme.join("24x24/status/blueman-action.png");
+
+    fs::create_dir_all(item_icon.parent().unwrap()).unwrap();
+    fs::create_dir_all(xdg_icon.parent().unwrap()).unwrap();
+    fs::write(
+      item_theme.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(
+      xdg_theme.join("index.theme"),
+      "[Icon Theme]\nDirectories=24x24/status\n[24x24/status]\nSize=24\nType=Fixed\n",
+    )
+    .unwrap();
+    fs::write(&item_icon, []).unwrap();
+    fs::write(&xdg_icon, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "blueman-action",
+        Some(&item_theme),
+        &[root.join("xdg")],
+        "hicolor",
+      ),
+      Some(item_icon)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn finds_and_renders_svg_icon() {
+    let root = std::env::temp_dir().join(format!("alpha-bar-tray-svg-test-{}", std::process::id()));
+    let icon = root.join("hicolor/scalable/status/blueman-action.svg");
+    fs::create_dir_all(icon.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("hicolor/index.theme"),
+      "[Icon Theme]\nDirectories=scalable/status\n[scalable/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(
+      &icon,
+      r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="2" height="1" fill="#ff0000"/></svg>"##,
+    )
+    .unwrap();
+
+    let path = find_icon_path("blueman-action", Some(&root), &[], "hicolor").unwrap();
+    let rendered = icon_from_path(&path).unwrap();
+
+    assert_eq!(path, icon);
+    assert_eq!(rendered.width, 2);
+    assert_eq!(rendered.height, 1);
+    assert_eq!(rendered.pixels, [0, 0, 255, 255, 0, 0, 255, 255]);
+
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn follows_configured_theme_and_declared_directories() {
+    let root =
+      std::env::temp_dir().join(format!("alpha-bar-tray-theme-test-{}", std::process::id()));
+    let selected = root.join("share/icons/Selected/symbolic/status/input-keyboard-symbolic.svg");
+    let unselected = root.join("share/icons/Other/symbolic/status/input-keyboard-symbolic.svg");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::create_dir_all(unselected.parent().unwrap()).unwrap();
+    fs::write(
+      root.join("share/icons/Selected/index.theme"),
+      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(
+      root.join("share/icons/Other/index.theme"),
+      "[Icon Theme]\nDirectories=symbolic/status\n[symbolic/status]\nSize=16\nType=Scalable\nMinSize=1\nMaxSize=64\n",
+    )
+    .unwrap();
+    fs::write(&selected, []).unwrap();
+    fs::write(&unselected, []).unwrap();
+
+    assert_eq!(
+      find_icon_path(
+        "input-keyboard-symbolic",
+        None,
+        &[root.join("share")],
+        "Selected",
+      ),
+      Some(selected)
+    );
+
+    let _ = fs::remove_dir_all(root);
+  }
 }

@@ -1,17 +1,17 @@
-use crate::format::battery_icon;
+use crate::runtime::Update;
+use crate::state::{Class, Segment, Side};
 use std::path::Path;
+use std::{sync::mpsc::Sender, thread, time::Duration};
+
+const ICONS: [&str; 11] = ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"];
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct Battery {
-  pub text: String,
-  pub class: &'static str,
+struct Battery {
+  text: String,
+  class: &'static str,
 }
 
-pub fn temp_c(raw: &str) -> Option<i64> {
-  raw.trim().parse::<i64>().ok().map(|milli| milli / 1000)
-}
-
-pub fn battery(capacity: &str, status: &str, ac_online: bool) -> Option<Battery> {
+fn battery(capacity: &str, status: &str, ac_online: bool) -> Option<Battery> {
   let capacity = capacity.trim().parse::<u8>().ok()?;
   let status = status.trim();
   if status == "Charging" {
@@ -32,7 +32,7 @@ pub fn battery(capacity: &str, status: &str, ac_online: bool) -> Option<Battery>
   }
 }
 
-pub fn system_battery(root: &Path) -> Option<Battery> {
+fn system_battery(root: &Path) -> Option<Battery> {
   std::fs::read_dir(root).ok()?.flatten().find_map(|entry| {
     let path = entry.path();
     if std::fs::read_to_string(path.join("type")).ok()?.trim() != "Battery" {
@@ -50,6 +50,41 @@ pub fn system_battery(root: &Path) -> Option<Battery> {
   })
 }
 
+pub fn segment(text: String, class: &str) -> Segment {
+  Segment::new(Side::Right, class_from_battery(class), text)
+}
+
+pub fn default_segment() -> Segment {
+  Segment::new(Side::Right, Class::Disconnected, "󰂑 N/A")
+}
+
+pub fn system_segment(root: &Path) -> Segment {
+  system_battery(root).map_or_else(default_segment, |battery| {
+    segment(battery.text, battery.class)
+  })
+}
+
+pub fn spawn(tx: Sender<Update>) {
+  thread::spawn(move || {
+    loop {
+      let _ = tx.send(Update::Battery(system_segment(Path::new(
+        "/sys/class/power_supply",
+      ))));
+      thread::sleep(Duration::from_secs(5));
+    }
+  });
+}
+
+fn class_from_battery(class: &str) -> Class {
+  match class {
+    "warning" => Class::Warning,
+    "critical" => Class::Critical,
+    "charging" => Class::Charging,
+    "plugged" => Class::Plugged,
+    _ => Class::Normal,
+  }
+}
+
 fn battery_class(capacity: u8) -> &'static str {
   if capacity <= 15 {
     "critical"
@@ -57,5 +92,62 @@ fn battery_class(capacity: u8) -> &'static str {
     "warning"
   } else {
     "normal"
+  }
+}
+
+fn battery_icon(capacity: u8) -> &'static str {
+  ICONS[(capacity as usize / 10).min(10)]
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+
+  #[test]
+  fn battery_state() {
+    let bat = battery("87\n", "Discharging\n", false).unwrap();
+    assert_eq!(bat.text, "󰂁 87%");
+    assert_eq!(bat.class, "normal");
+
+    let bat = battery("14\n", "Discharging\n", false).unwrap();
+    assert_eq!(bat.class, "critical");
+
+    let bat = battery("42\n", "Charging\n", false).unwrap();
+    assert_eq!(bat.text, "󰂄 42%");
+    assert_eq!(bat.class, "charging");
+
+    let bat = battery("99\n", "Full\n", true).unwrap();
+    assert_eq!(bat.text, " 99%");
+    assert_eq!(bat.class, "plugged");
+  }
+
+  #[test]
+  fn battery_icons() {
+    assert_eq!(battery_icon(0), "󰂎");
+    assert_eq!(battery_icon(10), "󰁺");
+    assert_eq!(battery_icon(100), "󰁹");
+  }
+
+  #[test]
+  fn reads_platform_battery_by_type_not_name() {
+    let root = std::env::temp_dir().join(format!("alpha-bar-power-{}", std::process::id()));
+    let battery_dir = root.join("macsmc-battery");
+    let usb_dir = root.join("tps6598x-source-psy-0-003a");
+    fs::create_dir_all(&battery_dir).unwrap();
+    fs::create_dir_all(&usb_dir).unwrap();
+    fs::write(battery_dir.join("type"), "Battery\n").unwrap();
+    fs::write(battery_dir.join("capacity"), "50\n").unwrap();
+    fs::write(battery_dir.join("status"), "Discharging\n").unwrap();
+    fs::write(usb_dir.join("type"), "USB\n").unwrap();
+    fs::write(usb_dir.join("capacity"), "100\n").unwrap();
+    fs::write(usb_dir.join("status"), "Charging\n").unwrap();
+
+    let bat = system_battery(&root).unwrap();
+
+    assert_eq!(bat.text, "󰁾 50%");
+    assert_eq!(bat.class, "normal");
+
+    let _ = fs::remove_dir_all(root);
   }
 }

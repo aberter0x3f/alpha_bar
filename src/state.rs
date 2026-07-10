@@ -63,3 +63,16 @@ impl Segment {
     self
   }
 }
+
+pub struct Snapshot {
+  pub workspaces: Vec<Segment>,
+  pub tray: Vec<Segment>,
+  pub network: Segment,
+  pub net_speed: Segment,
+  pub audio: Segment,
+  pub cpu: Segment,
+  pub memory: Segment,
+  pub temperature: Segment,
+  pub battery: Segment,
+  pub clock: Segment,
+}

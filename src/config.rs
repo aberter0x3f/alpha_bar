@@ -29,15 +29,3 @@ pub const STYLE: StyleConfig = StyleConfig {
   border_warning: "#d08770",
   border_critical: "#bf616a",
 };
-
-pub const MODULES_LEFT: [&str; 2] = ["niri/workspaces", "tray"];
-pub const MODULES_RIGHT: [&str; 8] = [
-  "network",
-  "net_speed",
-  "wireplumber",
-  "cpu",
-  "memory",
-  "temperature",
-  "battery",
-  "clock",
-];

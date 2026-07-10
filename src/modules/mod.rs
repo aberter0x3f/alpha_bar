@@ -1,8 +1,10 @@
 pub mod audio;
 pub mod clock;
+pub mod cpu;
+pub mod memory;
 pub mod net_speed;
 pub mod network;
 pub mod niri;
 pub mod power;
-pub mod proc_parse;
+pub mod temperature;
 pub mod tray;

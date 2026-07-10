@@ -3,11 +3,44 @@ use std::{
   io::{self, BufRead, BufReader, Write},
   os::unix::net::UnixStream,
   path::Path,
+  sync::mpsc::Sender,
+  thread,
 };
 
-use crate::state::{Class, Segment, Side};
+use crate::{
+  runtime::Update,
+  state::{Class, Segment, Side},
+};
 
-pub fn open_event_stream(path: impl AsRef<Path>) -> io::Result<UnixStream> {
+pub fn spawn(tx: Sender<Update>) {
+  thread::spawn(move || {
+    let Ok(socket) = std::env::var("NIRI_SOCKET") else {
+      return;
+    };
+    let mut state = NiriState::default();
+    if let Ok(workspaces) = request_workspaces(&socket) {
+      state.set_workspaces(workspaces);
+      if let Some(output) = state.focused_output() {
+        let _ = tx.send(Update::Workspaces(state.workspace_segments(output)));
+      }
+    }
+    let Ok(stream) = open_event_stream(socket) else {
+      return;
+    };
+    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+      let Ok(event) = serde_json::from_str(&line) else {
+        continue;
+      };
+      state.apply(&event);
+      let Some(output) = state.focused_output() else {
+        continue;
+      };
+      let _ = tx.send(Update::Workspaces(state.workspace_segments(output)));
+    }
+  });
+}
+
+fn open_event_stream(path: impl AsRef<Path>) -> io::Result<UnixStream> {
   let mut stream = UnixStream::connect(path)?;
   stream.write_all(b"\"EventStream\"\n")?;
   stream.flush()?;
@@ -21,7 +54,7 @@ pub fn open_event_stream(path: impl AsRef<Path>) -> io::Result<UnixStream> {
   }
 }
 
-pub fn request_workspaces(path: impl AsRef<Path>) -> io::Result<Vec<Workspace>> {
+fn request_workspaces(path: impl AsRef<Path>) -> io::Result<Vec<Workspace>> {
   let mut stream = UnixStream::connect(path)?;
   stream.write_all(b"\"Workspaces\"\n")?;
   stream.flush()?;
@@ -31,7 +64,7 @@ pub fn request_workspaces(path: impl AsRef<Path>) -> io::Result<Vec<Workspace>> 
   parse_workspaces_response(&value).ok_or_else(|| io::Error::other("niri rejected Workspaces"))
 }
 
-pub fn parse_workspaces_response(value: &Value) -> Option<Vec<Workspace>> {
+fn parse_workspaces_response(value: &Value) -> Option<Vec<Workspace>> {
   value
     .pointer("/Ok/Workspaces")
     .and_then(Value::as_array)
@@ -39,19 +72,19 @@ pub fn parse_workspaces_response(value: &Value) -> Option<Vec<Workspace>> {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Workspace {
-  pub id: u64,
-  pub idx: u64,
-  pub name: String,
-  pub output: String,
-  pub active: bool,
-  pub focused: bool,
-  pub urgent: bool,
-  pub empty: bool,
+struct Workspace {
+  id: u64,
+  idx: u64,
+  name: String,
+  output: String,
+  active: bool,
+  focused: bool,
+  urgent: bool,
+  empty: bool,
 }
 
 #[derive(Default)]
-pub struct NiriState {
+struct NiriState {
   workspaces: Vec<Workspace>,
 }
 
@@ -197,4 +230,104 @@ fn parse_workspace(value: &Value) -> Option<Workspace> {
 
 fn parse_workspaces(workspaces: &[Value]) -> Vec<Workspace> {
   workspaces.iter().filter_map(parse_workspace).collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+  use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixListener,
+    thread,
+  };
+
+  #[test]
+  fn workspace_events() {
+    let mut state = NiriState::default();
+
+    state.apply(&json!({
+      "WorkspacesChanged": { "workspaces": [
+        {"id": 1, "idx": 1, "name": "1", "output": "eDP-1", "is_active": true, "is_focused": true, "active_window_id": null},
+        {"id": 2, "idx": 2, "name": "2", "output": "eDP-1", "is_active": false, "is_focused": false, "active_window_id": null}
+      ]}
+    }));
+    state.apply(&json!({"WorkspaceActivated": {"id": 2, "focused": true}}));
+
+    let visible = state.visible_workspaces("eDP-1");
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].active);
+    assert!(visible[0].focused);
+    assert!(visible[0].empty);
+    assert_eq!(state.focused_output(), Some("eDP-1"));
+  }
+
+  #[test]
+  fn workspace_segments() {
+    let mut state = NiriState::default();
+    state.apply(&json!({
+      "WorkspacesChanged": { "workspaces": [
+        {"id": 1, "idx": 1, "name": "1", "output": "eDP-1", "is_active": false, "is_focused": false, "active_window_id": 7},
+        {"id": 2, "idx": 2, "name": "2", "output": "eDP-1", "is_active": true, "is_focused": true, "active_window_id": null},
+        {"id": 3, "idx": 3, "name": "3", "output": "eDP-1", "is_active": false, "is_focused": false, "is_urgent": true, "active_window_id": null},
+        {"id": 4, "idx": 4, "name": "4", "output": "eDP-1", "is_active": false, "is_focused": false, "active_window_id": null}
+      ]}
+    }));
+
+    let segments = state.workspace_segments("eDP-1");
+    assert_eq!(
+      segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+      ["1", "2", "3"]
+    );
+    assert_eq!(segments[0].class, Class::Normal);
+    assert_eq!(segments[1].class, Class::Active);
+    assert_eq!(segments[2].class, Class::Critical);
+  }
+
+  #[test]
+  fn initial_workspaces_response() {
+    let mut state = NiriState::default();
+    let response = json!({"Ok": {"Workspaces": [
+      {"id": 3, "idx": 3, "name": "3", "output": "HDMI-A-5", "is_active": false, "is_focused": false, "active_window_id": null},
+      {"id": 1, "idx": 1, "name": "1", "output": "HDMI-A-5", "is_active": false, "is_focused": false, "active_window_id": 84},
+      {"id": 2, "idx": 2, "name": "2", "output": "HDMI-A-5", "is_active": true, "is_focused": true, "active_window_id": 153},
+      {"id": 4, "idx": 4, "name": "4", "output": "HDMI-A-5", "is_active": false, "is_focused": false, "is_urgent": true, "active_window_id": null}
+    ]}});
+
+    state.set_workspaces(parse_workspaces_response(&response).unwrap());
+
+    let segments = state.workspace_segments("HDMI-A-5");
+    assert_eq!(
+      segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+      ["1", "2", "4"]
+    );
+  }
+
+  #[test]
+  fn unknown_events() {
+    let mut state = NiriState::default();
+    state.apply(&json!({"FutureEvent": {"field": 1}}));
+    assert!(state.visible_workspaces("eDP-1").is_empty());
+  }
+
+  #[test]
+  fn event_stream_socket() {
+    let path = std::env::temp_dir().join(format!("alpha-bar-niri-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+      let (mut stream, _) = listener.accept().unwrap();
+      let mut line = String::new();
+      BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+      assert_eq!(line, "\"EventStream\"\n");
+      stream.write_all(b"{\"Ok\":\"Handled\"}\n").unwrap();
+    });
+
+    let stream = open_event_stream(&path).unwrap();
+    drop(stream);
+    server.join().unwrap();
+    let _ = std::fs::remove_file(path);
+  }
 }
