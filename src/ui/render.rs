@@ -50,6 +50,8 @@ pub(crate) fn render_menu_scaled(
   height: usize,
   scale: u32,
   menu: &TrayMenuPopup,
+  origin_x: f64,
+  origin_y: f64,
 ) -> Vec<u8> {
   let scale = scale.max(1) as usize;
   let mut surface = cairo::ImageSurface::create(
@@ -65,6 +67,7 @@ pub(crate) fn render_menu_scaled(
   cr.fill().expect("clear menu surface");
   cr.set_operator(cairo::Operator::Over);
   let font = font_description(STYLE.font);
+  cr.translate(-origin_x, -origin_y);
   draw_menu(&cr, &font, menu);
   drop(cr);
   surface.flush();

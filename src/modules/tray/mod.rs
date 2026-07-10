@@ -9,6 +9,7 @@ use crate::{
   state::{Class, Click, Segment, Side, TrayMenuPopup},
 };
 
+mod bus;
 mod dbus_menu;
 mod icons;
 mod sni;

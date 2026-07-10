@@ -5,18 +5,16 @@ use std::{
 
 use zbus::{
   MatchRule,
-  blocking::{Connection, MessageIterator, connection},
+  blocking::{MessageIterator, connection},
   message::Header,
 };
 
-use super::PumpEvent;
+use super::{PumpEvent, bus};
 
 pub(super) fn watch_tray(tx: Sender<PumpEvent>) {
   start_watcher(tx.clone());
   let _ = tx.send(PumpEvent::Refresh);
-  watch_rule(&tx, "org.kde.StatusNotifierWatcher");
-  watch_rule(&tx, "org.kde.StatusNotifierItem");
-  watch_rule(&tx, "com.canonical.dbusmenu");
+  watch_signals(&tx);
 }
 
 #[derive(Clone)]
@@ -87,28 +85,37 @@ fn watcher_address_with_sender(service: &str, sender: &str) -> String {
   }
 }
 
-fn watch_rule(tx: &Sender<PumpEvent>, interface: &'static str) {
+fn watch_signals(tx: &Sender<PumpEvent>) {
   let tx = tx.clone();
   thread::spawn(move || {
-    let Ok(connection) = Connection::session() else {
+    let Ok(connection) = bus::session() else {
       return;
     };
-    let Ok(builder) = MatchRule::builder()
+    let rule = MatchRule::builder()
       .msg_type(zbus::message::Type::Signal)
-      .interface(interface)
-    else {
-      return;
-    };
-    let rule = builder.build();
+      .build();
     let Ok(messages) = MessageIterator::for_match_rule(rule, &connection, Some(32)) else {
       return;
     };
     for message in messages {
-      if message.is_ok() && tx.send(PumpEvent::Refresh).is_err() {
+      let Ok(message) = message else {
+        continue;
+      };
+      let Some(interface) = message.header().interface().map(|name| name.to_string()) else {
+        continue;
+      };
+      if watched_interface(&interface) && tx.send(PumpEvent::Refresh).is_err() {
         return;
       }
     }
   });
+}
+
+fn watched_interface(interface: &str) -> bool {
+  matches!(
+    interface,
+    "org.kde.StatusNotifierWatcher" | "org.kde.StatusNotifierItem" | "com.canonical.dbusmenu"
+  )
 }
 
 #[cfg(test)]
@@ -122,5 +129,12 @@ mod tests {
       ":1.2/StatusNotifierItem"
     );
     assert_eq!(watcher_address_with_sender(":1.3", ":1.2"), ":1.3");
+  }
+
+  #[test]
+  fn signal_filter() {
+    assert!(watched_interface("org.kde.StatusNotifierItem"));
+    assert!(watched_interface("com.canonical.dbusmenu"));
+    assert!(!watched_interface("org.freedesktop.DBus"));
   }
 }

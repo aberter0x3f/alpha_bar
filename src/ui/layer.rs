@@ -38,7 +38,7 @@ use crate::{
   runtime::{RuntimeCommand, Update},
   state::{Click, Snapshot, TrayMenuHit, TrayMenuPopup},
   ui::input::click_target_with_origin,
-  ui::layout::menu_hit,
+  ui::layout::{menu_height, menu_hit, menu_width},
   ui::render::{render_menu_scaled, render_ui_scaled},
 };
 
@@ -180,9 +180,19 @@ struct BarLayer {
 
 struct MenuLayer {
   layer: LayerSurface,
+  x: u32,
+  y: u32,
   width: u32,
   height: u32,
   dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuSurface {
+  x: u32,
+  y: u32,
+  width: u32,
+  height: u32,
 }
 
 impl SeatHandler for BarLayer {
@@ -264,7 +274,7 @@ impl BarLayer {
       return false;
     }
     self.menu = merge_menu(self.menu.take(), self.snapshot.tray_menu.clone());
-    let created_menu_layer = self.sync_menu_layer(qh, self.snapshot.tray_menu.is_some());
+    let created_menu_layer = self.sync_menu_layer(qh, self.menu.as_ref().map(menu_surface_size));
     if !created_menu_layer && let Some(menu_layer) = &mut self.menu_layer {
       menu_layer.dirty = true;
     }
@@ -273,32 +283,53 @@ impl BarLayer {
     true
   }
 
-  fn sync_menu_layer(&mut self, qh: &QueueHandle<Self>, open: bool) -> bool {
-    self.menu_open = open;
-    if !open {
+  fn sync_menu_layer(&mut self, qh: &QueueHandle<Self>, size: Option<MenuSurface>) -> bool {
+    self.menu_open = size.is_some();
+    let Some(menu_surface) = size else {
       self.menu_layer = None;
       return false;
-    }
-    if self.menu_layer.is_some() {
+    };
+    if let Some(menu_layer) = &mut self.menu_layer {
+      if menu_layer.x != menu_surface.x
+        || menu_layer.y != menu_surface.y
+        || menu_layer.width != menu_surface.width
+        || menu_layer.height != menu_surface.height
+      {
+        menu_layer.x = menu_surface.x;
+        menu_layer.y = menu_surface.y;
+        menu_layer.width = menu_surface.width;
+        menu_layer.height = menu_surface.height;
+        menu_layer
+          .layer
+          .set_margin(menu_surface.y as i32, 0, 0, menu_surface.x as i32);
+        menu_layer
+          .layer
+          .set_size(menu_surface.width, menu_surface.height);
+        menu_layer.layer.commit();
+        menu_layer.dirty = true;
+      }
       return false;
     }
-    let surface = self.compositor.create_surface(qh);
+    let wl_surface = self.compositor.create_surface(qh);
     let layer = self.layer_shell.create_layer_surface(
       qh,
-      surface,
+      wl_surface,
       Layer::Overlay,
       Some("alpha_bar_menu"),
       None,
     );
-    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.set_size(0, 0);
+    layer.set_margin(menu_surface.y as i32, 0, 0, menu_surface.x as i32);
+    layer.set_size(menu_surface.width, menu_surface.height);
     layer.set_exclusive_zone(0);
     layer.commit();
     self.menu_layer = Some(MenuLayer {
       layer,
-      width: 1,
-      height: 1,
+      x: menu_surface.x,
+      y: menu_surface.y,
+      width: menu_surface.width,
+      height: menu_surface.height,
       dirty: false,
     });
     true
@@ -338,6 +369,10 @@ impl BarLayer {
       let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuClose);
       return;
     };
+    let (x, y) = self
+      .menu_layer
+      .as_ref()
+      .map_or((x, y), |layer| (x + layer.x as f64, y + layer.y as f64));
     match menu_hit(menu, x, y) {
       TrayMenuHit::Activate { id } => {
         let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
@@ -390,6 +425,8 @@ impl BarLayer {
       menu_layer.height as usize,
       self.scale,
       menu,
+      menu_layer.x as f64,
+      menu_layer.y as f64,
     );
     paint_surface(
       &mut self.pool,
@@ -399,6 +436,15 @@ impl BarLayer {
       self.scale,
       &pixels,
     );
+  }
+}
+
+fn menu_surface_size(menu: &TrayMenuPopup) -> MenuSurface {
+  MenuSurface {
+    x: menu.x.floor().max(0.0) as u32,
+    y: menu.y.floor().max(0.0) as u32,
+    width: menu_width(menu).ceil().max(1.0) as u32,
+    height: menu_height(menu).ceil().max(1.0) as u32,
   }
 }
 
@@ -519,9 +565,10 @@ impl LayerShellHandler for BarLayer {
     } else if let Some(menu_layer) = &mut self.menu_layer
       && layer == &menu_layer.layer
     {
-      menu_layer.width = NonZeroU32::new(configure.new_size.0).map_or(self.width, NonZeroU32::get);
+      menu_layer.width =
+        NonZeroU32::new(configure.new_size.0).map_or(menu_layer.width, NonZeroU32::get);
       menu_layer.height =
-        NonZeroU32::new(configure.new_size.1).map_or(self.height, NonZeroU32::get);
+        NonZeroU32::new(configure.new_size.1).map_or(menu_layer.height, NonZeroU32::get);
       menu_layer.dirty = true;
     }
   }
@@ -662,5 +709,19 @@ mod tests {
     current.open_path = vec![0];
     let merged = super::merge_menu(Some(current), Some(menu(":1.1/StatusNotifierItem"))).unwrap();
     assert_eq!(merged.open_path, vec![0]);
+  }
+
+  #[test]
+  fn menu_surface_bounds() {
+    let menu = menu(":1.1/StatusNotifierItem");
+    assert_eq!(
+      super::menu_surface_size(&menu),
+      super::MenuSurface {
+        x: 0,
+        y: 32,
+        width: 160,
+        height: 24,
+      }
+    );
   }
 }

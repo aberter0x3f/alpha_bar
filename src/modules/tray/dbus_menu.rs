@@ -5,13 +5,14 @@ use std::{
 };
 
 use zbus::{
-  blocking::{Connection, Proxy},
+  blocking::Proxy,
   zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
 };
 
 use crate::state::{Icon, TrayMenuEntry, TrayMenuPopup};
 
 use super::{
+  bus,
   icons::{current_icon_theme, icon_from_name, icon_from_png_data, xdg_data_roots},
   sni::parse_address,
 };
@@ -49,7 +50,7 @@ type DbusMenuLayout = (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>))
 
 pub(super) fn activate_menu_item(address: &str, path: &str, id: i32) -> zbus::Result<()> {
   let (destination, _) = parse_address(address);
-  let connection = Connection::session()?;
+  let connection = bus::session()?;
   let proxy = Proxy::new(&connection, destination, path, "com.canonical.dbusmenu")?;
   let timestamp = SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -60,7 +61,7 @@ pub(super) fn activate_menu_item(address: &str, path: &str, id: i32) -> zbus::Re
 
 pub(super) fn menu_address(address: &str) -> Option<(String, Option<String>)> {
   let (destination, path) = parse_address(address);
-  let connection = Connection::session().ok()?;
+  let connection = bus::session().ok()?;
   let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").ok()?;
   let menu = proxy
     .get_property::<OwnedObjectPath>("Menu")
@@ -81,7 +82,7 @@ pub(super) fn refresh_tray_menu(
   icon_size: u32,
 ) -> zbus::Result<TrayMenuPopup> {
   let (destination, _) = parse_address(&address);
-  let connection = Connection::session()?;
+  let connection = bus::session()?;
   let layout = {
     let proxy = Proxy::new(
       &connection,
@@ -203,7 +204,16 @@ fn menu_entries(
 ) -> Vec<TrayMenuEntry> {
   items
     .iter()
-    .filter_map(|item| menu_entry(item, item_theme_path, xdg_data_roots, icon_theme, icon_size))
+    .filter_map(|item| {
+      menu_entry(
+        item,
+        item_theme_path,
+        xdg_data_roots,
+        icon_theme,
+        icon_size,
+        true,
+      )
+    })
     .collect()
 }
 
@@ -213,6 +223,7 @@ fn menu_entry(
   xdg_data_roots: &[PathBuf],
   icon_theme: &str,
   icon_size: u32,
+  resolve_icon: bool,
 ) -> Option<TrayMenuEntry> {
   if !item.visible {
     return None;
@@ -228,6 +239,7 @@ fn menu_entry(
         xdg_data_roots,
         icon_theme,
         icon_size,
+        false,
       )
     })
     .collect();
@@ -236,7 +248,9 @@ fn menu_entry(
     label: item.label.clone().unwrap_or_default(),
     enabled: item.enabled,
     separator,
-    icon: menu_item_icon(item, item_theme_path, xdg_data_roots, icon_theme, icon_size),
+    icon: resolve_icon
+      .then(|| menu_item_icon(item, item_theme_path, xdg_data_roots, icon_theme, icon_size))
+      .flatten(),
     children,
   })
 }
@@ -259,6 +273,7 @@ fn menu_item_icon(
 mod tests {
   use super::*;
   use crate::modules::tray::icons::tray_icon_size;
+  use std::io::Cursor;
 
   #[test]
   fn menu_tree() {
@@ -282,6 +297,39 @@ mod tests {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].label, "Parent");
     assert_eq!(entries[0].children[0].label, "Child");
+  }
+
+  #[test]
+  fn submenu_icon_lazy() {
+    let png = png_icon();
+    let menu = vec![MenuItem {
+      id: 1,
+      label: Some("Parent".into()),
+      enabled: true,
+      visible: true,
+      icon_data: Some(png.clone()),
+      submenu: vec![MenuItem {
+        id: 2,
+        label: Some("Child".into()),
+        enabled: true,
+        visible: true,
+        icon_data: Some(png),
+        ..Default::default()
+      }],
+      ..Default::default()
+    }];
+
+    let entries = menu_entries(&menu, None, &[], "hicolor", tray_icon_size(1));
+
+    assert!(entries[0].icon.is_some());
+    assert!(entries[0].children[0].icon.is_none());
+  }
+
+  fn png_icon() -> Vec<u8> {
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
+    let mut data = Cursor::new(Vec::new());
+    surface.write_to_png(&mut data).unwrap();
+    data.into_inner()
   }
 
   #[test]

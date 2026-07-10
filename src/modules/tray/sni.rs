@@ -1,4 +1,6 @@
-use zbus::blocking::{Connection, Proxy};
+use zbus::blocking::Proxy;
+
+use super::bus;
 
 #[derive(Clone, Default)]
 pub(super) struct TrayItem {
@@ -15,7 +17,7 @@ pub(super) fn tray_items() -> Vec<(String, TrayItem)> {
 }
 
 fn full_addresses() -> Vec<String> {
-  let Ok(connection) = Connection::session() else {
+  let Ok(connection) = bus::session() else {
     return Vec::new();
   };
   let Ok(proxy) = Proxy::new(
@@ -40,7 +42,7 @@ fn sort_addresses(mut addresses: Vec<String>) -> Vec<String> {
 
 fn query_item(address: &str) -> Option<TrayItem> {
   let (destination, path) = parse_address(address);
-  let connection = Connection::session().ok()?;
+  let connection = bus::session().ok()?;
   let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").ok()?;
   Some(TrayItem {
     icon_theme_path: proxy
@@ -59,7 +61,7 @@ fn query_item(address: &str) -> Option<TrayItem> {
 
 pub(super) fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
   let (destination, path) = parse_address(address);
-  let connection = Connection::session()?;
+  let connection = bus::session()?;
   let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
   proxy.call_method("ContextMenu", &(x, y))?;
   Ok(())
@@ -67,7 +69,7 @@ pub(super) fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<(
 
 pub(super) fn activate(address: &str, x: i32, y: i32) -> zbus::Result<()> {
   let (destination, path) = parse_address(address);
-  let connection = Connection::session()?;
+  let connection = bus::session()?;
   let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
   proxy.call_method("Activate", &(x, y))?;
   Ok(())

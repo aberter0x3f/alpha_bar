@@ -12,6 +12,7 @@ use cairo::{Format, ImageSurface};
 use crate::state::Icon;
 
 const TRAY_ICON_LOGICAL_SIZE: u32 = 20;
+const ICON_RENDER_CACHE_MAX_BYTES: usize = 512 * 1024;
 
 pub(super) fn tray_icon_size(scale: u32) -> u32 {
   TRAY_ICON_LOGICAL_SIZE * scale.max(1)
@@ -147,25 +148,15 @@ pub(super) fn icon_from_path(path: &Path, icon_size: u32) -> Option<Icon> {
     path: path.to_path_buf(),
     icon_size,
   };
-  if let Some(cached) = icon_render_cache().lock().ok()?.get(&key).cloned()
-    && cached.modified == modified
-    && cached.len == len
-  {
-    return Some(cached.icon);
+  if let Some(icon) = cached_render_icon(&key, modified, len) {
+    return Some(icon);
   }
   let icon = match path.extension().and_then(|extension| extension.to_str()) {
     Some("png") => icon_from_png(path),
     Some("svg") => icon_from_svg(path, icon_size),
     _ => None,
   }?;
-  icon_render_cache().lock().ok()?.insert(
-    key,
-    CachedIcon {
-      modified,
-      len,
-      icon: icon.clone(),
-    },
-  );
+  insert_render_icon(key, modified, len, icon.clone());
   Some(icon)
 }
 
@@ -281,10 +272,12 @@ struct CachedIcon {
   modified: Option<SystemTime>,
   len: u64,
   icon: Icon,
+  last_used: u64,
 }
 
 static ICON_PATH_CACHE: OnceLock<Mutex<HashMap<IconPathKey, PathBuf>>> = OnceLock::new();
 static ICON_RENDER_CACHE: OnceLock<Mutex<HashMap<IconRenderKey, CachedIcon>>> = OnceLock::new();
+static ICON_RENDER_TICK: OnceLock<Mutex<u64>> = OnceLock::new();
 
 fn icon_path_cache() -> &'static Mutex<HashMap<IconPathKey, PathBuf>> {
   ICON_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -292,6 +285,61 @@ fn icon_path_cache() -> &'static Mutex<HashMap<IconPathKey, PathBuf>> {
 
 fn icon_render_cache() -> &'static Mutex<HashMap<IconRenderKey, CachedIcon>> {
   ICON_RENDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_render_tick() -> u64 {
+  let mut tick = ICON_RENDER_TICK
+    .get_or_init(|| Mutex::new(0))
+    .lock()
+    .expect("lock icon render tick");
+  *tick += 1;
+  *tick
+}
+
+fn cached_render_icon(key: &IconRenderKey, modified: Option<SystemTime>, len: u64) -> Option<Icon> {
+  let mut cache = icon_render_cache().lock().ok()?;
+  let Some(cached) = cache.get_mut(key) else {
+    return None;
+  };
+  if cached.modified != modified || cached.len != len {
+    cache.remove(key);
+    return None;
+  }
+  cached.last_used = next_render_tick();
+  Some(cached.icon.clone())
+}
+
+fn insert_render_icon(key: IconRenderKey, modified: Option<SystemTime>, len: u64, icon: Icon) {
+  let Ok(mut cache) = icon_render_cache().lock() else {
+    return;
+  };
+  cache.insert(
+    key,
+    CachedIcon {
+      modified,
+      len,
+      icon,
+      last_used: next_render_tick(),
+    },
+  );
+  evict_render_cache(&mut cache);
+}
+
+fn render_cache_bytes(cache: &HashMap<IconRenderKey, CachedIcon>) -> usize {
+  cache.values().map(|cached| cached.icon.pixels.len()).sum()
+}
+
+fn evict_render_cache(cache: &mut HashMap<IconRenderKey, CachedIcon>) {
+  while render_cache_bytes(cache) > ICON_RENDER_CACHE_MAX_BYTES {
+    let Some(key) = cache
+      .iter()
+      .min_by_key(|(_, cached)| cached.last_used)
+      .map(|(key, _)| key.clone())
+    else {
+      break;
+    };
+    cache.remove(&key);
+  }
 }
 
 fn icon_roots(item_theme_path: Option<&Path>, xdg_data_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -615,6 +663,51 @@ mod tests {
   fn argb_icon_to_bgra() {
     let icon = icon_from_argb(1, 1, &[0xff, 0xff, 0x00, 0x00]).unwrap();
     assert_eq!(icon.pixels, [0x00, 0x00, 0xff, 0xff]);
+  }
+
+  #[test]
+  fn render_cache_bound() {
+    let mut cache = HashMap::new();
+    cache.insert(
+      IconRenderKey {
+        path: PathBuf::from("old"),
+        icon_size: 20,
+      },
+      CachedIcon {
+        modified: None,
+        len: 1,
+        icon: Icon {
+          width: 300,
+          height: 300,
+          pixels: vec![0; 300 * 300 * 4],
+        },
+        last_used: 1,
+      },
+    );
+    cache.insert(
+      IconRenderKey {
+        path: PathBuf::from("new"),
+        icon_size: 20,
+      },
+      CachedIcon {
+        modified: None,
+        len: 1,
+        icon: Icon {
+          width: 300,
+          height: 300,
+          pixels: vec![0; 300 * 300 * 4],
+        },
+        last_used: 2,
+      },
+    );
+
+    evict_render_cache(&mut cache);
+
+    assert!(render_cache_bytes(&cache) <= ICON_RENDER_CACHE_MAX_BYTES);
+    assert!(cache.contains_key(&IconRenderKey {
+      path: PathBuf::from("new"),
+      icon_size: 20,
+    }));
   }
 
   #[test]
