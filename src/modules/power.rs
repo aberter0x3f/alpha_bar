@@ -130,7 +130,7 @@ mod tests {
   }
 
   #[test]
-  fn reads_platform_battery_by_type_not_name() {
+  fn mac_battery() {
     let root = std::env::temp_dir().join(format!("alpha-bar-power-{}", std::process::id()));
     let battery_dir = root.join("macsmc-battery");
     let usb_dir = root.join("tps6598x-source-psy-0-003a");

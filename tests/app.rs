@@ -42,7 +42,7 @@ fn segments() {
 }
 
 #[test]
-fn empty_tray_is_not_rendered() {
+fn empty_tray() {
   let segments = build_segments(&Snapshot {
     workspaces: vec![Segment::new(Side::Left, Class::Active, "1")],
     tray: Vec::new(),

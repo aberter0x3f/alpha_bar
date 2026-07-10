@@ -285,7 +285,7 @@ mod tests {
   }
 
   #[test]
-  fn initial_workspaces_response() {
+  fn initial_reply() {
     let mut state = NiriState::default();
     let response = json!({"Ok": {"Workspaces": [
       {"id": 3, "idx": 3, "name": "3", "output": "HDMI-A-5", "is_active": false, "is_focused": false, "active_window_id": null},

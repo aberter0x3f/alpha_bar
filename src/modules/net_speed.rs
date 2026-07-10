@@ -90,7 +90,7 @@ mod tests {
   }
 
   #[test]
-  fn first_sample_only_sets_baseline() {
+  fn first_sample() {
     assert_eq!(rates_since(None, (10_000_000, 20_000_000), 1), None);
     assert_eq!(
       rates_since(

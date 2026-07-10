@@ -33,7 +33,7 @@ fn volume_percent(values: &[f32]) -> u8 {
     return 0;
   }
   let volume = values.iter().copied().sum::<f32>() / values.len() as f32;
-  ((volume * 100.0).round() as u8).min(100)
+  ((volume.cbrt() * 100.0).round() as u8).min(100)
 }
 
 pub fn pipewire_props(param: &Pod) -> Option<(u8, bool)> {
@@ -326,7 +326,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn pipewire_default_metadata_name() {
+  fn default_name() {
     assert_eq!(
       default_node_name(r#"{"name":"alsa_output.main"}"#),
       Some("alsa_output.main".into())
@@ -334,9 +334,10 @@ mod tests {
   }
 
   #[test]
-  fn pipewire_linear_volume_percent() {
-    assert_eq!(volume_percent(&[0.063997, 0.063997]), 6);
-    assert_eq!(volume_percent(&[0.4, 0.6]), 50);
+  fn cubic_volume() {
+    assert_eq!(volume_percent(&[0.064, 0.064]), 40);
+    assert_eq!(volume_percent(&[0.216, 0.216]), 60);
+    assert_eq!(volume_percent(&[0.512, 0.512]), 80);
     assert_eq!(volume_percent(&[2.0]), 100);
   }
 }

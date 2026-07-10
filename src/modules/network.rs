@@ -148,7 +148,7 @@ mod tests {
   }
 
   #[test]
-  fn wifi_text_uses_ssid_when_available() {
+  fn wifi_ssid() {
     assert_eq!(wifi_text("wlan0", Some("CafeNet")), "󰤨 CafeNet");
     assert_eq!(wifi_text("wlan0", None), "󰤨 wlan0");
   }

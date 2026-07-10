@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   fs::{self, File},
   path::{Path, PathBuf},
   sync::mpsc::{Receiver, Sender},
@@ -7,7 +8,6 @@ use std::{
 };
 
 use cairo::{Format, ImageSurface};
-use system_tray::client::ActivateRequest;
 
 use crate::{
   runtime::{RuntimeCommand, Update},
@@ -27,12 +27,12 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
         return;
       };
       let mut events = client.subscribe();
-      let _ = tx.send(Update::Tray(segments(&client)));
+      let _ = tx.send(Update::Tray(segments(&client).await));
       loop {
         tokio::select! {
           event = events.recv() => {
             if event.is_err() { return; }
-            let _ = tx.send(Update::Tray(segments(&client)));
+            let _ = tx.send(Update::Tray(segments(&client).await));
           }
           _ = tokio::time::sleep(Duration::from_millis(50)) => {
             while let Ok(command) = cmd_rx.try_recv() {
@@ -41,7 +41,7 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
                   if context_menu {
                     let _ = open_context_menu(&address, x, y).await;
                   } else {
-                    let _ = client.activate(ActivateRequest::Default { address, x, y }).await;
+                    let _ = activate(&address, x, y).await;
                   }
                 }
               }
@@ -53,16 +53,21 @@ pub fn spawn(tx: Sender<Update>, cmd_rx: Receiver<RuntimeCommand>) {
   });
 }
 
-fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
+async fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
   let items = client.items();
   let Ok(items) = items.lock() else {
     return Vec::new();
   };
   let xdg_data_roots = xdg_data_roots();
   let icon_theme = current_icon_theme();
+  let addresses = full_addresses().await;
   items
     .iter()
     .filter_map(|(address, (item, _))| {
+      let click_address = addresses
+        .get(address.as_str())
+        .cloned()
+        .unwrap_or_else(|| address.clone());
       item
         .icon_name
         .as_deref()
@@ -87,9 +92,32 @@ fn segments(client: &system_tray::client::Client) -> Vec<Segment> {
             .and_then(|pixmap| icon_from_argb(pixmap.width, pixmap.height, &pixmap.pixels))
         })
         .map(|icon| {
-          Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(address.clone()))
+          Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(click_address))
         })
     })
+    .collect()
+}
+
+async fn full_addresses() -> HashMap<String, String> {
+  let Ok(connection) = zbus::Connection::session().await else {
+    return HashMap::new();
+  };
+  let Ok(proxy) = zbus::Proxy::new(
+    &connection,
+    "org.kde.StatusNotifierWatcher",
+    "/StatusNotifierWatcher",
+    "org.kde.StatusNotifierWatcher",
+  )
+  .await
+  else {
+    return HashMap::new();
+  };
+  proxy
+    .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|address| (parse_address(&address).0.to_owned(), address))
     .collect()
 }
 
@@ -99,6 +127,15 @@ async fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
   let proxy =
     zbus::Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
   proxy.call_method("ContextMenu", &(x, y)).await?;
+  Ok(())
+}
+
+async fn activate(address: &str, x: i32, y: i32) -> zbus::Result<()> {
+  let (destination, path) = parse_address(address);
+  let connection = zbus::Connection::session().await?;
+  let proxy =
+    zbus::Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
+  proxy.call_method("Activate", &(x, y)).await?;
   Ok(())
 }
 
@@ -503,7 +540,7 @@ mod tests {
   }
 
   #[test]
-  fn finds_png_icon_from_item_theme_path_first() {
+  fn item_theme_png() {
     let root = std::env::temp_dir().join(format!("alpha-bar-tray-test-{}", std::process::id()));
     let item_theme = root.join("item-theme");
     let xdg_theme = root.join("xdg/icons/hicolor");
@@ -539,7 +576,7 @@ mod tests {
   }
 
   #[test]
-  fn finds_and_renders_svg_icon() {
+  fn svg_icon() {
     let root = std::env::temp_dir().join(format!("alpha-bar-tray-svg-test-{}", std::process::id()));
     let icon = root.join("hicolor/scalable/status/blueman-action.svg");
     fs::create_dir_all(icon.parent().unwrap()).unwrap();
@@ -566,7 +603,7 @@ mod tests {
   }
 
   #[test]
-  fn follows_configured_theme_and_declared_directories() {
+  fn theme_dirs() {
     let root =
       std::env::temp_dir().join(format!("alpha-bar-tray-theme-test-{}", std::process::id()));
     let selected = root.join("share/icons/Selected/symbolic/status/input-keyboard-symbolic.svg");
@@ -597,5 +634,17 @@ mod tests {
     );
 
     let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn activation_path() {
+    assert_eq!(
+      parse_address(":1.58/StatusNotifierItem"),
+      (":1.58", "/StatusNotifierItem".into())
+    );
+    assert_eq!(
+      parse_address(":1.59/org/ayatana/NotificationItem/nm_applet"),
+      (":1.59", "/org/ayatana/NotificationItem/nm_applet".into())
+    );
   }
 }

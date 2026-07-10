@@ -31,7 +31,7 @@ fn segment_underlines() {
 }
 
 #[test]
-fn right_segments_keep_config_order() {
+fn right_order() {
   let pixels = render_segments(
     120,
     32,
@@ -77,7 +77,7 @@ fn tray_icon_pixels() {
 }
 
 #[test]
-fn tray_icons_are_resampled_when_scaled() {
+fn tray_resample() {
   let pixels = render_segments(
     40,
     32,
@@ -108,7 +108,7 @@ fn workspace_min_width() {
 }
 
 #[test]
-fn default_bar_has_foreground_pixels() {
+fn foreground_pixels() {
   let pixels = render_segments(320, 32, &[Segment::new(Side::Left, Class::Active, "1")]);
   assert!(
     pixels
@@ -118,7 +118,7 @@ fn default_bar_has_foreground_pixels() {
 }
 
 #[test]
-fn scaled_render_uses_physical_pixels() {
+fn scaled_pixels() {
   let pixels = render_segments_scaled(80, 32, 2, &[Segment::new(Side::Left, Class::Active, "1")]);
   assert_eq!(pixels.len(), 160 * 64 * 4);
   let underline = ((60 * 160 + 16) * 4)..((60 * 160 + 17) * 4);
@@ -126,7 +126,7 @@ fn scaled_render_uses_physical_pixels() {
 }
 
 #[test]
-fn workspace_text_is_centered_over_underline() {
+fn workspace_centering() {
   let pixels = render_segments(80, 32, &[Segment::new(Side::Left, Class::Active, "1")]);
   let background = [0x52, 0x42, 0x3b, 0xff];
   let underline = [0xbb, 0xbc, 0x8f, 0xff];
