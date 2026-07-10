@@ -16,3 +16,12 @@ pub fn format_rates(rx_diff: u64, tx_diff: u64, dt_us: u64) -> String {
     format_rate(tx_diff, dt_us)
   )
 }
+
+pub fn rates_since(old: Option<(u64, u64)>, new: (u64, u64), dt_us: u64) -> Option<String> {
+  let old = old?;
+  Some(format_rates(
+    new.0.saturating_sub(old.0),
+    new.1.saturating_sub(old.1),
+    dt_us,
+  ))
+}

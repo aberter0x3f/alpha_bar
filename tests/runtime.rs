@@ -7,7 +7,20 @@ use alpha_bar::{
 fn network_states() {
   assert_eq!(network_text(None, "up"), "󰲛 Disconnected");
   assert_eq!(network_text(Some("enp4s0"), "up"), "󰈀 enp4s0");
+  assert_eq!(network_text(Some("wlan0"), "up"), "󰤨 wlan0");
   assert_eq!(network_text(Some("wlan0"), "down"), "wlan0 (No IP)");
+}
+
+#[test]
+fn wifi_text_uses_ssid_when_available() {
+  assert_eq!(
+    alpha_bar::runtime::wifi_network_text("wlan0", Some("CafeNet")),
+    "󰤨 CafeNet"
+  );
+  assert_eq!(
+    alpha_bar::runtime::wifi_network_text("wlan0", None),
+    "󰤨 wlan0"
+  );
 }
 
 #[test]

@@ -72,8 +72,32 @@ fn tray_icon_pixels() {
     )],
   );
 
-  let icon_pixel = ((6 * 40 + 8) * 4)..((6 * 40 + 9) * 4);
+  let icon_pixel = ((16 * 40 + 18) * 4)..((16 * 40 + 19) * 4);
   assert_eq!(&pixels[icon_pixel], [0x00, 0x00, 0xff, 0xff]);
+}
+
+#[test]
+fn tray_icons_are_resampled_when_scaled() {
+  let pixels = render_segments(
+    40,
+    32,
+    &[Segment::icon(
+      Side::Left,
+      Class::Normal,
+      Icon {
+        width: 2,
+        height: 2,
+        pixels: vec![
+          0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff,
+          0xff,
+        ],
+      },
+    )],
+  );
+
+  let center = ((16 * 40 + 18) * 4)..((16 * 40 + 19) * 4);
+  assert_ne!(&pixels[center.clone()], [0x00, 0x00, 0xff, 0xff]);
+  assert_ne!(&pixels[center], [0xff, 0x00, 0x00, 0xff]);
 }
 
 #[test]

@@ -17,7 +17,7 @@ use crate::{
   app::Snapshot,
   clock::clock_text,
   modules::{audio, network, tray},
-  net_speed::{format_rate, format_rates},
+  net_speed::{format_rates, rates_since},
   niri::{NiriState, open_event_stream, request_workspaces},
   power,
   proc_parse::{cpu_usage, mem_usage},
@@ -146,27 +146,24 @@ fn spawn_cpu(tx: Sender<Update>) {
 fn spawn_net_speed(tx: Sender<Update>) {
   thread::spawn(move || {
     let mut iface = None;
-    let mut old = (0, 0);
+    let mut old = None;
     let mut then = Instant::now();
     loop {
       let route = fs::read_to_string("/proc/net/route").unwrap_or_default();
       let current_iface = network::default_iface(&route).map(str::to_owned);
       if current_iface != iface {
         iface = current_iface;
-        old = (0, 0);
+        old = None;
         then = Instant::now();
       }
       if let Some(name) = iface.as_deref()
         && let Ok(dev) = fs::read_to_string("/proc/net/dev")
         && let Some(new) = network::dev_bytes(&dev, name)
       {
-        let dt_us = then.elapsed().as_micros() as u64;
-        let _ = tx.send(Update::NetSpeed(format!(
-          "↓ {} ↑ {}",
-          format_rate(new.0.saturating_sub(old.0), dt_us),
-          format_rate(new.1.saturating_sub(old.1), dt_us)
-        )));
-        old = new;
+        if let Some(text) = rates_since(old, new, then.elapsed().as_micros() as u64) {
+          let _ = tx.send(Update::NetSpeed(text));
+        }
+        old = Some(new);
         then = Instant::now();
       }
       thread::sleep(Duration::from_secs(2));
@@ -506,24 +503,27 @@ fn tray_segments(client: &system_tray::client::Client) -> Vec<Segment> {
     .iter()
     .filter_map(|(address, (item, _))| {
       item
-        .icon_pixmap
-        .as_ref()
-        .and_then(|pixmaps| {
-          pixmaps
-            .iter()
-            .max_by_key(|pixmap| pixmap.width * pixmap.height)
+        .icon_name
+        .as_deref()
+        .and_then(|name| {
+          tray::find_icon_path(
+            name,
+            item.icon_theme_path.as_deref().map(std::path::Path::new),
+            &xdg_data_roots,
+            &icon_theme,
+          )
+          .and_then(|path| tray::icon_from_path(&path))
         })
-        .and_then(|pixmap| tray::icon_from_argb(pixmap.width, pixmap.height, &pixmap.pixels))
         .or_else(|| {
-          item.icon_name.as_deref().and_then(|name| {
-            tray::find_icon_path(
-              name,
-              item.icon_theme_path.as_deref().map(std::path::Path::new),
-              &xdg_data_roots,
-              &icon_theme,
-            )
-            .and_then(|path| tray::icon_from_path(&path))
-          })
+          item
+            .icon_pixmap
+            .as_ref()
+            .and_then(|pixmaps| {
+              pixmaps
+                .iter()
+                .max_by_key(|pixmap| pixmap.width * pixmap.height)
+            })
+            .and_then(|pixmap| tray::icon_from_argb(pixmap.width, pixmap.height, &pixmap.pixels))
         })
         .map(|icon| {
           Segment::icon(Side::Left, Class::Normal, icon).click(Click::Tray(address.clone()))
@@ -621,10 +621,69 @@ fn xdg_data_roots() -> Vec<PathBuf> {
 pub fn network_text(iface: Option<&str>, operstate: &str) -> String {
   match (iface, operstate.trim()) {
     (None, _) => "󰲛 Disconnected".into(),
-    (Some(iface), "up") if iface.starts_with('w') => format!("󰤨 {iface}"),
+    (Some(iface), "up") if iface.starts_with('w') => {
+      wifi_network_text(iface, wireless_ssid(iface).as_deref())
+    }
     (Some(iface), "up") => format!("󰈀 {iface}"),
     (Some(iface), _) => format!("{iface} (No IP)"),
   }
+}
+
+pub fn wifi_network_text(iface: &str, ssid: Option<&str>) -> String {
+  format!("󰤨 {}", ssid.filter(|s| !s.is_empty()).unwrap_or(iface))
+}
+
+fn wireless_ssid(iface: &str) -> Option<String> {
+  const SIOCGIWESSID: libc::c_ulong = 0x8B1B;
+  #[repr(C)]
+  struct IwPoint {
+    pointer: *mut libc::c_void,
+    length: u16,
+    flags: u16,
+  }
+  #[repr(C)]
+  union IwreqData {
+    essid: std::mem::ManuallyDrop<IwPoint>,
+  }
+  #[repr(C)]
+  struct Iwreq {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    data: IwreqData,
+  }
+
+  let mut essid = [0u8; 33];
+  let mut req = Iwreq {
+    name: [0; libc::IFNAMSIZ],
+    data: IwreqData {
+      essid: std::mem::ManuallyDrop::new(IwPoint {
+        pointer: essid.as_mut_ptr().cast(),
+        length: 32,
+        flags: 0,
+      }),
+    },
+  };
+  for (dst, src) in req.name.iter_mut().zip(iface.bytes()) {
+    *dst = src as libc::c_char;
+  }
+  // SAFETY: ioctl writes at most `length` bytes into the valid stack buffer above.
+  let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+  if fd < 0 {
+    return None;
+  }
+  let ok = unsafe { libc::ioctl(fd, SIOCGIWESSID, &mut req) } == 0;
+  let _ = unsafe { libc::close(fd) };
+  if !ok {
+    return None;
+  }
+  let len = unsafe { req.data.essid.length as usize }.min(essid.len());
+  String::from_utf8(
+    essid[..len]
+      .iter()
+      .copied()
+      .take_while(|b| *b != 0)
+      .collect(),
+  )
+  .ok()
 }
 
 fn current_network_text() -> String {
@@ -659,23 +718,10 @@ fn current_clock() -> String {
 }
 
 fn battery_text() -> (String, Class) {
-  let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
-    return (" 100%".into(), Class::Plugged);
-  };
-  for entry in entries.flatten() {
-    let name = entry.file_name();
-    let name = name.to_string_lossy();
-    if !name.starts_with("BAT") {
-      continue;
-    }
-    let path = entry.path();
-    let capacity = fs::read_to_string(path.join("capacity")).unwrap_or_default();
-    let status = fs::read_to_string(path.join("status")).unwrap_or_default();
-    if let Some(battery) = power::battery(&capacity, &status, false) {
-      return (battery.text, class_from_battery(battery.class));
-    }
-  }
-  (" 100%".into(), Class::Plugged)
+  power::system_battery(std::path::Path::new("/sys/class/power_supply")).map_or_else(
+    || ("󰂑 N/A".into(), Class::Disconnected),
+    |battery| (battery.text, class_from_battery(battery.class)),
+  )
 }
 
 fn class_from_battery(class: &str) -> Class {

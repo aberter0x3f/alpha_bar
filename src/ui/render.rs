@@ -82,23 +82,24 @@ fn draw_segment(cr: &cairo::Context, segment: &Segment, x: f64, segment_width: f
 }
 
 fn draw_icon(cr: &cairo::Context, x: f64, y: f64, icon: &crate::state::Icon) {
-  for row in 0..20 {
-    for col in 0..20 {
-      let src_x = col * icon.width / 20;
-      let src_y = row * icon.height / 20;
-      let index = (src_y * icon.width + src_x) * 4;
-      if index + 3 >= icon.pixels.len() {
-        continue;
-      }
-      let b = icon.pixels[index] as f64 / 255.0;
-      let g = icon.pixels[index + 1] as f64 / 255.0;
-      let r = icon.pixels[index + 2] as f64 / 255.0;
-      let a = icon.pixels[index + 3] as f64 / 255.0;
-      cr.set_source_rgba(r, g, b, a);
-      cr.rectangle(x + col as f64, y + row as f64, 1.0, 1.0);
-      cr.fill().expect("fill icon pixel");
-    }
-  }
+  let Ok(surface) = cairo::ImageSurface::create_for_data(
+    icon.pixels.clone(),
+    cairo::Format::ARgb32,
+    icon.width as i32,
+    icon.height as i32,
+    icon.width as i32 * 4,
+  ) else {
+    return;
+  };
+  cr.save().expect("save icon context");
+  cr.translate(x, y);
+  let scale = 20.0 / icon.height as f64;
+  cr.scale(scale, scale);
+  let pattern = cairo::SurfacePattern::create(&surface);
+  pattern.set_filter(cairo::Filter::Best);
+  cr.set_source(&pattern).expect("set icon source");
+  cr.paint().expect("paint icon");
+  cr.restore().expect("restore icon context");
 }
 
 fn draw_text_centered(cr: &cairo::Context, x: f64, y: f64, width: f64, text: &str) {

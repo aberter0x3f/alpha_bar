@@ -56,7 +56,6 @@ pub fn run(
   layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
   layer.set_keyboard_interactivity(KeyboardInteractivity::None);
   layer.set_size(0, BAR.height);
-  layer.set_margin(BAR.height as i32, 0, 0, 0);
   layer.set_exclusive_zone(BAR.height as i32);
   layer.commit();
 
