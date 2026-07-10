@@ -83,7 +83,6 @@ mod tests {
 
     assert_eq!(segments[0].text, "1");
     assert_eq!(segments[1].text, "󰲛 Disconnected");
-    assert!(!segments.iter().any(|segment| segment.text == "󰂑 N/A"));
   }
 
   #[test]

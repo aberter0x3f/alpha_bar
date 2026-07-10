@@ -86,23 +86,26 @@ pub(crate) fn menu_columns(menu: &TrayMenuPopup) -> Vec<&[TrayMenuEntry]> {
   columns
 }
 
-pub(crate) fn menu_column_width(entries: &[TrayMenuEntry]) -> f64 {
+pub(crate) fn menu_column_width(
+  entries: &[TrayMenuEntry],
+  text_width: &dyn Fn(&str) -> f64,
+) -> f64 {
   entries
     .iter()
     .map(|entry| {
       if entry.separator {
         MENU_MIN_WIDTH
       } else {
-        entry.label.chars().count() as f64 * 10.0 + MENU_ICON_WIDTH + MENU_ARROW_WIDTH + 16.0
+        text_width(&entry.label) + MENU_ICON_WIDTH + MENU_ARROW_WIDTH + 16.0
       }
     })
     .fold(MENU_MIN_WIDTH, f64::max)
 }
 
-pub(crate) fn menu_width(menu: &TrayMenuPopup) -> f64 {
+pub(crate) fn menu_width(menu: &TrayMenuPopup, text_width: &dyn Fn(&str) -> f64) -> f64 {
   menu_columns(menu)
     .iter()
-    .map(|entries| menu_column_width(entries))
+    .map(|entries| menu_column_width(entries, text_width))
     .sum()
 }
 
@@ -113,14 +116,23 @@ pub(crate) fn menu_height(menu: &TrayMenuPopup) -> f64 {
     .fold(0.0, f64::max)
 }
 
-pub(crate) fn menu_hit(menu: &TrayMenuPopup, x: f64, y: f64) -> TrayMenuHit {
-  if x < menu.x || y < menu.y || x >= menu.x + menu_width(menu) || y >= menu.y + menu_height(menu) {
+pub(crate) fn menu_hit(
+  menu: &TrayMenuPopup,
+  x: f64,
+  y: f64,
+  text_width: &dyn Fn(&str) -> f64,
+) -> TrayMenuHit {
+  if x < menu.x
+    || y < menu.y
+    || x >= menu.x + menu_width(menu, text_width)
+    || y >= menu.y + menu_height(menu)
+  {
     return TrayMenuHit::Outside;
   }
   let mut column_x = menu.x;
   let mut path = Vec::new();
   for entries in menu_columns(menu) {
-    let column_width = menu_column_width(entries);
+    let column_width = menu_column_width(entries, text_width);
     if x >= column_x && x < column_x + column_width {
       let row = ((y - menu.y) / MENU_ROW_HEIGHT) as usize;
       let Some(entry) = entries.get(row) else {
@@ -144,14 +156,23 @@ pub(crate) fn menu_hit(menu: &TrayMenuPopup, x: f64, y: f64) -> TrayMenuHit {
   TrayMenuHit::Outside
 }
 
-pub(crate) fn menu_hover(menu: &TrayMenuPopup, x: f64, y: f64) -> Option<Vec<usize>> {
-  if x < menu.x || y < menu.y || x >= menu.x + menu_width(menu) || y >= menu.y + menu_height(menu) {
+pub(crate) fn menu_hover(
+  menu: &TrayMenuPopup,
+  x: f64,
+  y: f64,
+  text_width: &dyn Fn(&str) -> f64,
+) -> Option<Vec<usize>> {
+  if x < menu.x
+    || y < menu.y
+    || x >= menu.x + menu_width(menu, text_width)
+    || y >= menu.y + menu_height(menu)
+  {
     return None;
   }
   let mut column_x = menu.x;
   let mut path = Vec::new();
   for entries in menu_columns(menu) {
-    let column_width = menu_column_width(entries);
+    let column_width = menu_column_width(entries, text_width);
     if x >= column_x && x < column_x + column_width {
       let row = ((y - menu.y) / MENU_ROW_HEIGHT) as usize;
       let entry = entries.get(row)?;
@@ -172,10 +193,13 @@ pub(crate) fn menu_hover(menu: &TrayMenuPopup, x: f64, y: f64) -> Option<Vec<usi
 
 #[cfg(test)]
 mod tests {
+  use crate::ui::text;
+
   use super::*;
 
   #[test]
   fn menu_click_hit() {
+    let measure = text::TextMeasure::new("Sans 16");
     let menu = TrayMenuPopup {
       address: ":1.2/StatusNotifierItem".into(),
       path: "/menu".into(),
@@ -192,11 +216,15 @@ mod tests {
       open_path: Vec::new(),
     };
 
-    assert_eq!(menu_hit(&menu, 24.0, 34.0), TrayMenuHit::Activate { id: 7 });
+    assert_eq!(
+      menu_hit(&menu, 24.0, 34.0, &|value| measure.width(value)),
+      TrayMenuHit::Activate { id: 7 }
+    );
   }
 
   #[test]
   fn submenu_hit() {
+    let measure = text::TextMeasure::new("Sans 16");
     let mut menu = TrayMenuPopup {
       address: ":1.2/StatusNotifierItem".into(),
       path: "/menu".into(),
@@ -221,18 +249,24 @@ mod tests {
     };
 
     assert_eq!(
-      menu_hit(&menu, 4.0, 36.0),
+      menu_hit(&menu, 4.0, 36.0, &|value| measure.width(value)),
       TrayMenuHit::OpenSubmenu { path: vec![0] }
     );
     menu.open_path = vec![0];
     assert_eq!(
-      menu_hit(&menu, menu_column_width(&menu.entries) + 4.0, 36.0),
+      menu_hit(
+        &menu,
+        menu_column_width(&menu.entries, &|value| measure.width(value)) + 4.0,
+        36.0,
+        &|value| measure.width(value),
+      ),
       TrayMenuHit::Activate { id: 2 }
     );
   }
 
   #[test]
   fn menu_hover_path() {
+    let measure = text::TextMeasure::new("Sans 16");
     let menu = TrayMenuPopup {
       address: ":1.2/StatusNotifierItem".into(),
       path: "/menu".into(),
@@ -259,8 +293,43 @@ mod tests {
       open_path: Vec::new(),
     };
 
-    assert_eq!(menu_hover(&menu, 4.0, 36.0), Some(vec![0]));
-    assert_eq!(menu_hover(&menu, 4.0, 60.0), Some(vec![1]));
-    assert_eq!(menu_hover(&menu, 4.0, 90.0), None);
+    assert_eq!(
+      menu_hover(&menu, 4.0, 36.0, &|value| measure.width(value)),
+      Some(vec![0])
+    );
+    assert_eq!(
+      menu_hover(&menu, 4.0, 60.0, &|value| measure.width(value)),
+      Some(vec![1])
+    );
+    assert_eq!(
+      menu_hover(&menu, 4.0, 90.0, &|value| measure.width(value)),
+      None
+    );
+  }
+
+  #[test]
+  fn menu_text_width() {
+    let measure = text::TextMeasure::new("Sans 16");
+    let wide = vec![TrayMenuEntry {
+      id: 1,
+      label: "WWWWWWWWWWWWWWWW".into(),
+      enabled: true,
+      separator: false,
+      icon: None,
+      children: Vec::new(),
+    }];
+    let narrow = vec![TrayMenuEntry {
+      id: 2,
+      label: "iiiiiiiiiiiiiiii".into(),
+      enabled: true,
+      separator: false,
+      icon: None,
+      children: Vec::new(),
+    }];
+
+    assert!(
+      menu_column_width(&wide, &|value| measure.width(value))
+        > menu_column_width(&narrow, &|value| measure.width(value))
+    );
   }
 }

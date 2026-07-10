@@ -34,12 +34,13 @@ use wayland_client::{
 
 use crate::{
   app::build_segments,
-  config::BAR,
+  config::{BAR, STYLE},
   runtime::{RuntimeCommand, Update},
   state::{Click, Snapshot, TrayMenuHit, TrayMenuPopup},
   ui::input::click_target_with_origin,
   ui::layout::{menu_height, menu_hit, menu_hover, menu_width},
   ui::render::{render_menu_scaled, render_ui_scaled},
+  ui::text::TextMeasure,
 };
 
 pub fn run(
@@ -382,7 +383,8 @@ impl BarLayer {
       .menu_layer
       .as_ref()
       .map_or((x, y), |layer| (x + layer.x as f64, y + layer.y as f64));
-    match menu_hit(menu, x, y) {
+    let measure = TextMeasure::new(STYLE.font);
+    match menu_hit(menu, x, y, &|text| measure.width(text)) {
       TrayMenuHit::Activate { id } => {
         let _ = self.cmd_tx.send(RuntimeCommand::TrayMenuItem {
           address: menu.address.clone(),
@@ -411,7 +413,8 @@ impl BarLayer {
       .menu_layer
       .as_ref()
       .map_or((x, y), |layer| (x + layer.x as f64, y + layer.y as f64));
-    let hover = menu_hover(menu, x, y);
+    let measure = TextMeasure::new(STYLE.font);
+    let hover = menu_hover(menu, x, y, &|text| measure.width(text));
     if self.menu_hover != hover {
       self.menu_hover = hover;
       if let Some(menu_layer) = &mut self.menu_layer {
@@ -476,10 +479,13 @@ impl BarLayer {
 }
 
 fn menu_surface_size(menu: &TrayMenuPopup) -> MenuSurface {
+  let measure = TextMeasure::new(STYLE.font);
   MenuSurface {
     x: menu.x.floor().max(0.0) as u32,
     y: menu.y.floor().max(0.0) as u32,
-    width: menu_width(menu).ceil().max(1.0) as u32,
+    width: menu_width(menu, &|text| measure.width(text))
+      .ceil()
+      .max(1.0) as u32,
     height: menu_height(menu).ceil().max(1.0) as u32,
   }
 }

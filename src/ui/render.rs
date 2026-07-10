@@ -84,7 +84,7 @@ fn draw_menu(
   let mut x = menu.x;
   let mut path_prefix = Vec::new();
   for entries in menu_columns(menu) {
-    let width = menu_column_width(entries);
+    let width = menu_column_width(entries, &|text| text_width(cr, font, text));
     set_color(cr, argb(STYLE.background));
     cr.rectangle(x, menu.y, width, entries.len() as f64 * MENU_ROW_HEIGHT);
     cr.fill().expect("fill tray menu");

@@ -15,11 +15,8 @@ pub fn click_target_with_origin(
 }
 
 pub fn click_at_with_origin(width: usize, x: f64, segments: &[&Segment]) -> Option<(Click, f64)> {
-  let surface =
-    cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).expect("create input measure surface");
-  let cr = cairo::Context::new(&surface).expect("create input measure context");
-  let font = text::font_description(STYLE.font);
-  for rect in layout_segments(width, segments, |value| text::text_width(&cr, &font, value)) {
+  let measure = text::TextMeasure::new(STYLE.font);
+  for rect in layout_segments(width, segments, |value| measure.width(value)) {
     if (rect.x..rect.x + rect.width).contains(&x) {
       return rect.segment.click.clone().map(|click| (click, rect.x));
     }
@@ -49,10 +46,8 @@ mod tests {
 
   #[test]
   fn text_width_uses_font_metrics() {
-    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
-    let cr = cairo::Context::new(&surface).unwrap();
-    let font = text::font_description("Sans");
+    let measure = text::TextMeasure::new("Sans");
 
-    assert!(text::text_width(&cr, &font, "WWWW") > text::text_width(&cr, &font, "iiii"));
+    assert!(measure.width("WWWW") > measure.width("iiii"));
   }
 }
