@@ -1,4 +1,42 @@
 use serde_json::Value;
+use std::{
+  io::{self, BufRead, BufReader, Write},
+  os::unix::net::UnixStream,
+  path::Path,
+};
+
+use crate::state::{Class, Segment, Side};
+
+pub fn open_event_stream(path: impl AsRef<Path>) -> io::Result<UnixStream> {
+  let mut stream = UnixStream::connect(path)?;
+  stream.write_all(b"\"EventStream\"\n")?;
+  stream.flush()?;
+
+  let mut line = String::new();
+  BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+  if line.trim_end() == r#"{"Ok":"Handled"}"# {
+    Ok(stream)
+  } else {
+    Err(io::Error::other("niri rejected event stream"))
+  }
+}
+
+pub fn request_workspaces(path: impl AsRef<Path>) -> io::Result<Vec<Workspace>> {
+  let mut stream = UnixStream::connect(path)?;
+  stream.write_all(b"\"Workspaces\"\n")?;
+  stream.flush()?;
+  let mut line = String::new();
+  BufReader::new(stream).read_line(&mut line)?;
+  let value = serde_json::from_str(&line).map_err(io::Error::other)?;
+  parse_workspaces_response(&value).ok_or_else(|| io::Error::other("niri rejected Workspaces"))
+}
+
+pub fn parse_workspaces_response(value: &Value) -> Option<Vec<Workspace>> {
+  value
+    .pointer("/Ok/Workspaces")
+    .and_then(Value::as_array)
+    .map(|workspaces| parse_workspaces(workspaces))
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Workspace {
@@ -18,15 +56,18 @@ pub struct NiriState {
 }
 
 impl NiriState {
+  pub fn set_workspaces(&mut self, workspaces: Vec<Workspace>) {
+    self.workspaces = workspaces;
+    self.sort_workspaces();
+  }
+
   pub fn apply(&mut self, event: &Value) {
     if let Some(workspaces) = event
       .pointer("/WorkspacesChanged/workspaces")
       .and_then(Value::as_array)
     {
-      self.workspaces = workspaces.iter().filter_map(parse_workspace).collect();
-      self
-        .workspaces
-        .sort_by(|a, b| (&a.output, a.idx).cmp(&(&b.output, b.idx)));
+      self.workspaces = parse_workspaces(workspaces);
+      self.sort_workspaces();
     } else if let Some(payload) = event.get("WorkspaceActivated") {
       self.activate(payload);
     } else if let Some(payload) = event.get("WorkspaceActiveWindowChanged") {
@@ -40,9 +81,25 @@ impl NiriState {
     self
       .workspaces
       .iter()
-      .filter(|ws| ws.output == output)
+      .filter(|ws| ws.output == output && (!ws.empty || ws.active || ws.focused || ws.urgent))
       .cloned()
       .collect()
+  }
+
+  pub fn workspace_segments(&self, output: &str) -> Vec<Segment> {
+    self
+      .visible_workspaces(output)
+      .into_iter()
+      .map(|ws| Segment::new(Side::Left, workspace_class(&ws), ws.name))
+      .collect()
+  }
+
+  pub fn focused_output(&self) -> Option<&str> {
+    self
+      .workspaces
+      .iter()
+      .find(|ws| ws.focused)
+      .map(|ws| ws.output.as_str())
   }
 
   fn activate(&mut self, payload: &Value) {
@@ -93,6 +150,22 @@ impl NiriState {
       ws.urgent = urgent;
     }
   }
+
+  fn sort_workspaces(&mut self) {
+    self
+      .workspaces
+      .sort_by(|a, b| (&a.output, a.idx).cmp(&(&b.output, b.idx)));
+  }
+}
+
+fn workspace_class(ws: &Workspace) -> Class {
+  if ws.urgent {
+    Class::Critical
+  } else if ws.active || ws.focused {
+    Class::Active
+  } else {
+    Class::Normal
+  }
 }
 
 fn parse_workspace(value: &Value) -> Option<Workspace> {
@@ -120,4 +193,8 @@ fn parse_workspace(value: &Value) -> Option<Workspace> {
       .unwrap_or(false),
     empty: value.get("active_window_id").is_some_and(Value::is_null),
   })
+}
+
+fn parse_workspaces(workspaces: &[Value]) -> Vec<Workspace> {
+  workspaces.iter().filter_map(parse_workspace).collect()
 }

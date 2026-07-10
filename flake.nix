@@ -23,9 +23,24 @@
             packages = with pkgs; [
               cargo
               clippy
+              pkg-config
               rustc
               rustfmt
+              llvmPackages.libclang
             ];
+
+            buildInputs = with pkgs; [
+              cairo
+              libxkbcommon
+              pango
+              pipewire
+              wayland
+            ];
+
+            env = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+            };
           };
         }
       );
@@ -41,6 +56,19 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = with pkgs; [
+              llvmPackages.libclang
+              pkg-config
+            ];
+            buildInputs = with pkgs; [
+              cairo
+              libxkbcommon
+              pango
+              pipewire
+              wayland
+            ];
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
             meta.mainProgram = "alpha_bar";
           };
         }
