@@ -30,7 +30,7 @@ pub struct StyleConfig {
 pub const BAR: BarConfig = BarConfig { height: 32 };
 
 pub const STYLE: StyleConfig = StyleConfig {
-  font: "SarasaMonoSC Nerd Font",
+  font: "Monospace",
   background: "#3b4252",
   foreground: "#eceff4",
   border_normal: "#4c566a",
