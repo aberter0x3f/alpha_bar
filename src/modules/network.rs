@@ -129,7 +129,7 @@ fn format_rate(diff_bytes: u64, dt_us: u64) -> String {
 
 fn format_rates(rx_diff: u64, tx_diff: u64, dt_us: u64) -> String {
   format!(
-    "↓ {} ↑ {}",
+    " {}  {}",
     format_rate(rx_diff, dt_us),
     format_rate(tx_diff, dt_us)
   )
@@ -231,7 +231,7 @@ mod tests {
     assert_eq!(format_rate(1536 * 1024, 1_000_000), "1.50 M");
     assert_eq!(
       format_rates(1536 * 1024, 512 * 1024, 1_000_000),
-      "↓ 1.50 M ↑ 512 K"
+      " 1.50 M  512 K"
     );
   }
 
@@ -244,7 +244,7 @@ mod tests {
         (10_512_000, 20_512_000),
         1_000_000
       ),
-      Some("↓ 500 K ↑ 500 K".into())
+      Some(" 500 K  500 K".into())
     );
   }
 }
