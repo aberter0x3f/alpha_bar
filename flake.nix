@@ -16,10 +16,22 @@
 {
   description = "alpha_bar";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      treefmt-nix,
+      ...
+    }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -37,6 +49,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              cargo-edit
               clippy
               pkg-config
               rustc
@@ -96,6 +109,19 @@
         };
       });
 
-      formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
+      formatter = forEachSystem (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        treefmt-nix.lib.mkWrapper pkgs {
+          projectRootFile = "flake.nix";
+          programs = {
+            nixfmt.enable = true;
+            rustfmt.enable = true;
+            taplo.enable = true;
+          };
+        }
+      );
     };
 }

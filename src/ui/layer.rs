@@ -706,14 +706,8 @@ impl KeyboardHandler for BarLayer {
   }
 }
 
-smithay_client_toolkit::delegate_compositor!(BarLayer);
-smithay_client_toolkit::delegate_layer!(BarLayer);
-smithay_client_toolkit::delegate_output!(BarLayer);
+smithay_client_toolkit::delegate_dispatch2!(BarLayer);
 smithay_client_toolkit::delegate_registry!(BarLayer);
-smithay_client_toolkit::delegate_seat!(BarLayer);
-smithay_client_toolkit::delegate_keyboard!(BarLayer);
-smithay_client_toolkit::delegate_pointer!(BarLayer);
-smithay_client_toolkit::delegate_shm!(BarLayer);
 
 impl ProvidesRegistryState for BarLayer {
   fn registry(&mut self) -> &mut RegistryState {

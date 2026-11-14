@@ -14,15 +14,13 @@
 */
 
 use std::{
+  num::NonZeroUsize,
   sync::{Arc, Mutex, mpsc::Sender},
   thread,
 };
 
-use zbus::{
-  MatchRule,
-  blocking::{MessageIterator, connection},
-  message::Header,
-};
+use futures_lite::StreamExt;
+use zbus::{MatchRule, MessageStream, connection, message::Header};
 
 use super::{PumpEvent, bus};
 
@@ -74,13 +72,15 @@ fn start_watcher(tx: Sender<PumpEvent>) {
       items: Arc::new(Mutex::new(Vec::new())),
       tx,
     };
-    let Ok(_connection) = connection::Builder::session()
-      .and_then(|builder| builder.serve_at("/StatusNotifierWatcher", watcher))
-      .and_then(|builder| builder.name("org.kde.StatusNotifierWatcher"))
-      .and_then(|builder| builder.build())
-    else {
+    let Ok(_connection) = zbus::block_on(
+      connection::Builder::session()
+        .serve_at("/StatusNotifierWatcher", watcher)
+        .name("org.kde.StatusNotifierWatcher")
+        .build(),
+    ) else {
       return;
     };
+    // zbus keeps the connection runtime active after block_on returns.
     loop {
       thread::park();
     }
@@ -103,26 +103,33 @@ fn watcher_address_with_sender(service: &str, sender: &str) -> String {
 fn watch_signals(tx: &Sender<PumpEvent>) {
   let tx = tx.clone();
   thread::spawn(move || {
-    let Ok(connection) = bus::session() else {
-      return;
-    };
-    let rule = MatchRule::builder()
-      .msg_type(zbus::message::Type::Signal)
-      .build();
-    let Ok(messages) = MessageIterator::for_match_rule(rule, &connection, Some(32)) else {
-      return;
-    };
-    for message in messages {
-      let Ok(message) = message else {
-        continue;
-      };
-      let Some(interface) = message.header().interface().map(|name| name.to_string()) else {
-        continue;
-      };
-      if watched_interface(&interface) && tx.send(PumpEvent::Refresh).is_err() {
+    zbus::block_on(async move {
+      let Ok(connection) = bus::session().await else {
         return;
+      };
+      let Ok(rule) = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .build()
+      else {
+        return;
+      };
+      let Ok(mut messages) =
+        MessageStream::for_match_rule(rule, &connection, NonZeroUsize::new(32)).await
+      else {
+        return;
+      };
+      while let Some(message) = messages.next().await {
+        let Ok(message) = message else {
+          continue;
+        };
+        let Some(interface) = message.header().interface().map(|name| name.to_string()) else {
+          continue;
+        };
+        if watched_interface(&interface) && tx.send(PumpEvent::Refresh).is_err() {
+          return;
+        }
       }
-    }
+    })
   });
 }
 

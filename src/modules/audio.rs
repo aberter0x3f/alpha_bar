@@ -24,11 +24,7 @@ use std::{
 
 use pipewire::{
   self as pw,
-  spa::{
-    self,
-    pod::{Pod, deserialize::PodDeserializer},
-    utils::Id,
-  },
+  spa::{self, pod::Pod, utils::Id},
 };
 
 use crate::{
@@ -48,11 +44,12 @@ pub fn default_node_name(value: &str) -> Option<String> {
     .or_else(|| Some(value.to_owned()).filter(|value| !value.is_empty()))
 }
 
-fn volume_percent(values: &[f32]) -> u8 {
-  if values.is_empty() {
+fn volume_percent(values: impl Iterator<Item = f32>) -> u8 {
+  let (sum, count) = values.fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
+  if count == 0 {
     return 0;
   }
-  let volume = values.iter().copied().sum::<f32>() / values.len() as f32;
+  let volume = sum / count as f32;
   ((volume.cbrt() * 100.0).round() as u8).min(100)
 }
 
@@ -64,13 +61,30 @@ pub fn pipewire_props(param: &Pod) -> Option<(u8, bool)> {
     .unwrap_or(false);
   let volumes = object
     .find_prop(Id(spa::sys::SPA_PROP_channelVolumes))
-    .and_then(|prop| pipewire_float_array(prop.value()))?;
-  Some((volume_percent(&volumes), muted))
+    .and_then(|prop| pipewire_volume(prop.value()))?;
+  Some((volumes, muted))
 }
 
-fn pipewire_float_array(pod: &Pod) -> Option<Vec<f32>> {
-  let (_, values) = PodDeserializer::deserialize_from::<Vec<f32>>(pod.as_bytes()).ok()?;
-  Some(values)
+fn pipewire_volume(pod: &Pod) -> Option<u8> {
+  if !pod.is_array() {
+    return None;
+  }
+  let bytes = pod.as_bytes();
+  let child_size = u32::from_ne_bytes(bytes.get(8..12)?.try_into().ok()?);
+  let child_type = u32::from_ne_bytes(bytes.get(12..16)?.try_into().ok()?);
+  if child_size != 4 || child_type != spa::sys::SPA_TYPE_Float {
+    return None;
+  }
+  // Pod::as_bytes excludes alignment padding. Read only the declared elements.
+  let values = bytes.get(16..)?;
+  if values.len() % 4 != 0 {
+    return None;
+  }
+  Some(volume_percent(
+    values
+      .chunks_exact(4)
+      .map(|value| f32::from_ne_bytes(value.try_into().unwrap())),
+  ))
 }
 
 pub fn text(volume: u8, muted: bool) -> String {
@@ -390,10 +404,39 @@ mod tests {
 
   #[test]
   fn cubic_volume() {
-    assert_eq!(volume_percent(&[0.064, 0.064]), 40);
-    assert_eq!(volume_percent(&[0.216, 0.216]), 60);
-    assert_eq!(volume_percent(&[0.512, 0.512]), 80);
-    assert_eq!(volume_percent(&[2.0]), 100);
+    assert_eq!(volume_percent([0.064, 0.064].into_iter()), 40);
+    assert_eq!(volume_percent([0.216, 0.216].into_iter()), 60);
+    assert_eq!(volume_percent([0.512, 0.512].into_iter()), 80);
+    assert_eq!(volume_percent([2.0].into_iter()), 100);
+  }
+
+  #[test]
+  fn channel_props() {
+    use spa::pod::{Object, Property, Value, ValueArray, serialize::PodSerializer};
+    for channels in [1, 2, 3] {
+      for muted in [false, true] {
+        let props = Value::Object(Object {
+          type_: spa::sys::SPA_TYPE_OBJECT_Props,
+          id: spa::sys::SPA_PARAM_Props,
+          properties: vec![
+            Property::new(spa::sys::SPA_PROP_mute, Value::Bool(muted)),
+            Property::new(
+              spa::sys::SPA_PROP_channelVolumes,
+              Value::ValueArray(ValueArray::Float(vec![0.274625; channels])),
+            ),
+          ],
+        });
+        let (bytes, _) =
+          PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &props).unwrap();
+        let bytes = bytes.into_inner();
+        let pod = Pod::from_bytes(&bytes).unwrap();
+        assert_eq!(
+          pipewire_props(pod),
+          Some((65, muted)),
+          "channels={channels}"
+        );
+      }
+    }
   }
 
   #[test]

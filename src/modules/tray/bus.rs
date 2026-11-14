@@ -15,15 +15,15 @@
 
 use std::sync::OnceLock;
 
-use zbus::blocking::Connection;
+use zbus::Connection;
 
 static SESSION: OnceLock<Connection> = OnceLock::new();
 
-pub(super) fn session() -> zbus::Result<Connection> {
+pub(super) async fn session() -> zbus::Result<Connection> {
   if let Some(connection) = SESSION.get() {
     return Ok(connection.clone());
   }
-  let connection = Connection::session()?;
+  let connection = Connection::session().await?;
   let _ = SESSION.set(connection.clone());
   Ok(SESSION.get().unwrap_or(&connection).clone())
 }

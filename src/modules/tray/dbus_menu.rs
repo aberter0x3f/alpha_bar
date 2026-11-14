@@ -19,10 +19,7 @@ use std::{
   time::{SystemTime, UNIX_EPOCH},
 };
 
-use zbus::{
-  blocking::Proxy,
-  zvariant::{Array, OwnedObjectPath, OwnedValue, Structure, Value},
-};
+use zbus::{Array, OwnedObjectPath, OwnedVariant, Proxy, Structure, Variant};
 
 use crate::state::{Icon, TrayMenuEntry, TrayMenuPopup};
 
@@ -61,32 +58,42 @@ impl From<&str> for MenuType {
   }
 }
 
-type DbusMenuLayout = (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>));
+type DbusMenuLayout = (u32, (i32, HashMap<String, OwnedVariant>, Vec<OwnedVariant>));
 
 pub(super) fn activate_menu_item(address: &str, path: &str, id: i32) -> zbus::Result<()> {
-  let (destination, _) = parse_address(address);
-  let connection = bus::session()?;
-  let proxy = Proxy::new(&connection, destination, path, "com.canonical.dbusmenu")?;
-  let timestamp = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map_or(0, |duration| duration.as_secs() as u32);
-  proxy.call_method("Event", &(id, "clicked", Value::I32(0), timestamp))?;
-  Ok(())
+  zbus::block_on(async {
+    let (destination, _) = parse_address(address);
+    let connection = bus::session().await?;
+    let proxy = Proxy::new(&connection, destination, path, "com.canonical.dbusmenu").await?;
+    let timestamp = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(0, |duration| duration.as_secs() as u32);
+    proxy
+      .call_method("Event", &(id, "clicked", Variant::I32(0), timestamp))
+      .await?;
+    Ok(())
+  })
 }
 
 pub(super) fn menu_address(address: &str) -> Option<(String, Option<String>)> {
-  let (destination, path) = parse_address(address);
-  let connection = bus::session().ok()?;
-  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").ok()?;
-  let menu = proxy
-    .get_property::<OwnedObjectPath>("Menu")
-    .ok()?
-    .to_string();
-  let theme_path = proxy
-    .get_property::<String>("IconThemePath")
-    .ok()
-    .filter(|path| !path.is_empty());
-  Some((menu, theme_path))
+  zbus::block_on(async {
+    let (destination, path) = parse_address(address);
+    let connection = bus::session().await.ok()?;
+    let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")
+      .await
+      .ok()?;
+    let menu = proxy
+      .get_property::<OwnedObjectPath>("Menu")
+      .await
+      .ok()?
+      .to_string();
+    let theme_path = proxy
+      .get_property::<String>("IconThemePath")
+      .await
+      .ok()
+      .filter(|path| !path.is_empty());
+    Some((menu, theme_path))
+  })
 }
 
 pub(super) fn refresh_tray_menu(
@@ -96,18 +103,21 @@ pub(super) fn refresh_tray_menu(
   x: i32,
   icon_size: u32,
 ) -> zbus::Result<TrayMenuPopup> {
-  let (destination, _) = parse_address(&address);
-  let connection = bus::session()?;
-  let layout = {
+  let layout = zbus::block_on(async {
+    let (destination, _) = parse_address(&address);
+    let connection = bus::session().await?;
     let proxy = Proxy::new(
       &connection,
       destination,
       path.as_str(),
       "com.canonical.dbusmenu",
-    )?;
-    let _: bool = proxy.call("AboutToShow", &0i32).unwrap_or(false);
-    proxy.call::<_, _, DbusMenuLayout>("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))?
-  };
+    )
+    .await?;
+    let _: bool = proxy.call("AboutToShow", &0i32).await.unwrap_or(false);
+    proxy
+      .call::<_, _, DbusMenuLayout>("GetLayout", &(0i32, -1i32, Vec::<&str>::new()))
+      .await
+  })?;
   let menu = menu_items_from_layout(layout);
   let xdg_data_roots = xdg_data_roots();
   let icon_theme = current_icon_theme();
@@ -148,10 +158,13 @@ pub(super) fn pending_menu(address: String, path: String, x: i32) -> TrayMenuPop
 
 fn menu_items_from_layout(layout: DbusMenuLayout) -> Vec<MenuItem> {
   let (_, (_, _, submenus)) = layout;
-  submenus.iter().filter_map(menu_item_from_value).collect()
+  submenus
+    .iter()
+    .filter_map(|value| menu_item_from_value(value))
+    .collect()
 }
 
-fn menu_item_from_value(value: &OwnedValue) -> Option<MenuItem> {
+fn menu_item_from_value(value: &Variant<'_>) -> Option<MenuItem> {
   let structure = value.downcast_ref::<&Structure>().ok()?;
   let mut fields = structure.fields().iter();
   let mut menu = MenuItem {
@@ -159,10 +172,10 @@ fn menu_item_from_value(value: &OwnedValue) -> Option<MenuItem> {
     visible: true,
     ..Default::default()
   };
-  if let Some(Value::I32(id)) = fields.next() {
+  if let Some(Variant::I32(id)) = fields.next() {
     menu.id = *id;
   }
-  if let Some(Value::Dict(dict)) = fields.next() {
+  if let Some(Variant::Dict(dict)) = fields.next() {
     menu.label = dict
       .get::<&str, &str>(&"label")
       .ok()
@@ -200,12 +213,8 @@ fn menu_item_from_value(value: &OwnedValue) -> Option<MenuItem> {
       .map(MenuType::from)
       .unwrap_or_default();
   }
-  if let Some(Value::Array(array)) = fields.next() {
-    menu.submenu = array
-      .iter()
-      .filter_map(|value| OwnedValue::try_from(value).ok())
-      .filter_map(|value| menu_item_from_value(&value))
-      .collect();
+  if let Some(Variant::Array(array)) = fields.next() {
+    menu.submenu = array.iter().filter_map(menu_item_from_value).collect();
   }
   Some(menu)
 }

@@ -13,7 +13,7 @@
   see <https://www.gnu.org/licenses/>.
 */
 
-use zbus::blocking::Proxy;
+use zbus::Proxy;
 
 use super::bus;
 
@@ -25,14 +25,19 @@ pub(super) struct TrayItem {
 }
 
 pub(super) fn tray_items() -> Vec<(String, TrayItem)> {
-  full_addresses()
-    .into_iter()
-    .filter_map(|address| query_item(&address).map(|item| (address, item)))
-    .collect()
+  zbus::block_on(async {
+    let mut items = Vec::new();
+    for address in full_addresses().await {
+      if let Some(item) = query_item(&address).await {
+        items.push((address, item));
+      }
+    }
+    items
+  })
 }
 
-fn full_addresses() -> Vec<String> {
-  let Ok(connection) = bus::session() else {
+async fn full_addresses() -> Vec<String> {
+  let Ok(connection) = bus::session().await else {
     return Vec::new();
   };
   let Ok(proxy) = Proxy::new(
@@ -40,12 +45,15 @@ fn full_addresses() -> Vec<String> {
     "org.kde.StatusNotifierWatcher",
     "/StatusNotifierWatcher",
     "org.kde.StatusNotifierWatcher",
-  ) else {
+  )
+  .await
+  else {
     return Vec::new();
   };
   sort_addresses(
     proxy
       .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
+      .await
       .unwrap_or_default(),
   )
 }
@@ -55,39 +63,48 @@ fn sort_addresses(mut addresses: Vec<String>) -> Vec<String> {
   addresses
 }
 
-fn query_item(address: &str) -> Option<TrayItem> {
+async fn query_item(address: &str) -> Option<TrayItem> {
   let (destination, path) = parse_address(address);
-  let connection = bus::session().ok()?;
-  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").ok()?;
+  let connection = bus::session().await.ok()?;
+  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")
+    .await
+    .ok()?;
   Some(TrayItem {
     icon_theme_path: proxy
       .get_property::<String>("IconThemePath")
+      .await
       .ok()
       .filter(|path| !path.is_empty()),
     icon_name: proxy
       .get_property::<String>("IconName")
+      .await
       .ok()
       .filter(|name| !name.is_empty()),
     icon_pixmap: proxy
       .get_property::<Vec<(i32, i32, Vec<u8>)>>("IconPixmap")
+      .await
       .unwrap_or_default(),
   })
 }
 
 pub(super) fn open_context_menu(address: &str, x: i32, y: i32) -> zbus::Result<()> {
-  let (destination, path) = parse_address(address);
-  let connection = bus::session()?;
-  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
-  proxy.call_method("ContextMenu", &(x, y))?;
-  Ok(())
+  zbus::block_on(async {
+    let (destination, path) = parse_address(address);
+    let connection = bus::session().await?;
+    let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
+    proxy.call_method("ContextMenu", &(x, y)).await?;
+    Ok(())
+  })
 }
 
 pub(super) fn activate(address: &str, x: i32, y: i32) -> zbus::Result<()> {
-  let (destination, path) = parse_address(address);
-  let connection = bus::session()?;
-  let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem")?;
-  proxy.call_method("Activate", &(x, y))?;
-  Ok(())
+  zbus::block_on(async {
+    let (destination, path) = parse_address(address);
+    let connection = bus::session().await?;
+    let proxy = Proxy::new(&connection, destination, path, "org.kde.StatusNotifierItem").await?;
+    proxy.call_method("Activate", &(x, y)).await?;
+    Ok(())
+  })
 }
 
 pub(super) fn parse_address(address: &str) -> (&str, String) {
